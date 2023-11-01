@@ -145,7 +145,7 @@ impl<F: Field, const N_BYTES: usize> LtEqV1Instruction<F> for LtEqV1Chip<F, N_BY
 
         let lt = con1 < (con2 + F::one());
 
-        println!("Anything wrong here? {:?} {:?}", con1, con2);
+        // println!("Anything wrong here? {:?} {:?}", con1, con2);
 
         region.assign_advice(
             || "lt chip: lt",
