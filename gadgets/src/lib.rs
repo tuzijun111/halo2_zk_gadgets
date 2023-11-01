@@ -22,6 +22,7 @@ pub mod mul_add;
 pub mod util;
 pub mod less_than_copy;
 pub mod lessthan_or_equal;
+pub mod lessthan_or_equal_v1;
 
 use eth_types::Field;
 use halo2_proofs::{
