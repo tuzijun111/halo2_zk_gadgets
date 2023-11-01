@@ -14,7 +14,7 @@ use super::{
 };
 
 /// Instruction that the Lt chip needs to implement.
-pub trait LtEqInstruction<F: FieldExt> {
+pub trait LtEqV1Insttruction<F: FieldExt> {
     /// Assign the lhs and rhs witnesses to the Lt chip's region.
     fn assign(
         &self,
@@ -32,7 +32,7 @@ pub trait LtEqInstruction<F: FieldExt> {
 
 /// Config for the Lt chip.
 #[derive(Clone, Copy, Debug)]
-pub struct LtEqConfig<F, const N_BYTES: usize> {
+pub struct LtEqV1Config<F, const N_BYTES: usize> {
     /// Denotes the lt outcome. If lhs < rhs then lt == 1, otherwise lt == 0.
     pub lt: Column<Advice>,
     /// Denotes the bytes representation of the difference between lhs and rhs.
@@ -43,7 +43,7 @@ pub struct LtEqConfig<F, const N_BYTES: usize> {
     pub range: F,
 }
 
-impl<F: Field, const N_BYTES: usize> LtEqConfig<F, N_BYTES> {
+impl<F: Field, const N_BYTES: usize> LtEqV1Config<F, N_BYTES> {
     /// Returns an expression that denotes whether lhs < rhs, or not.
     pub fn is_lt(&self, meta: &mut VirtualCells<F>, rotation: Option<Rotation>) -> Expression<F> {
         meta.query_advice(self.lt, rotation.unwrap_or_else(Rotation::cur))
@@ -52,11 +52,11 @@ impl<F: Field, const N_BYTES: usize> LtEqConfig<F, N_BYTES> {
 
 /// Chip that compares lhs < rhs.
 #[derive(Clone, Debug)]
-pub struct LtEqChip<F, const N_BYTES: usize> {
-    config: LtEqConfig<F, N_BYTES>,
+pub struct LtEqV1Chip<F, const N_BYTES: usize> {
+    config: LtEqV1Config<F, N_BYTES>,
 }
 
-impl<F: Field, const N_BYTES: usize> LtEqChip<F, N_BYTES> {
+impl<F: Field, const N_BYTES: usize> LtEqV1Chip<F, N_BYTES> {
     /// Configures the Lt chip.
     pub fn configure(
         meta: &mut ConstraintSystem<F>,
@@ -65,7 +65,7 @@ impl<F: Field, const N_BYTES: usize> LtEqChip<F, N_BYTES> {
         rhs: impl FnOnce(&mut VirtualCells<F>) -> Expression<F>,
         lhs1: impl FnOnce(&mut VirtualCells<F>) -> Expression<F>,
         rhs1: impl FnOnce(&mut VirtualCells<F>) -> Expression<F>,
-    ) -> LtEqConfig<F, N_BYTES> {
+    ) -> LtEqV1Config<F, N_BYTES> {
         let lt = meta.advice_column();
         let diff = [(); N_BYTES].map(|_| meta.advice_column());
         let range = pow_of_two(N_BYTES * 8);
@@ -110,7 +110,7 @@ impl<F: Field, const N_BYTES: usize> LtEqChip<F, N_BYTES> {
             });
         });
 
-        LtEqConfig {
+        LtEqV1Config {
             lt,
             diff,
             range,
@@ -119,12 +119,12 @@ impl<F: Field, const N_BYTES: usize> LtEqChip<F, N_BYTES> {
     }
 
     /// Constructs a Lt chip given a config.
-    pub fn construct(config: LtEqConfig<F, N_BYTES>) -> LtEqChip<F, N_BYTES> {
-        LtEqChip { config }
+    pub fn construct(config: LtEqV1Config<F, N_BYTES>) -> LtEqV1Chip<F, N_BYTES> {
+        LtEqV1Chip { config }
     }
 }
 
-impl<F: Field, const N_BYTES: usize> LtEqInstruction<F> for LtEqChip<F, N_BYTES> {
+impl<F: Field, const N_BYTES: usize> LtEqV1Insttruction<F> for LtEqV1Chip<F, N_BYTES> {
     fn assign(
         &self,
         region: &mut Region<'_, F>,
@@ -189,8 +189,8 @@ impl<F: Field, const N_BYTES: usize> LtEqInstruction<F> for LtEqChip<F, N_BYTES>
     }
 }
 
-impl<F: Field, const N_BYTES: usize> Chip<F> for LtEqChip<F, N_BYTES> {
-    type Config = LtEqConfig<F, N_BYTES>;
+impl<F: Field, const N_BYTES: usize> Chip<F> for LtEqV1Chip<F, N_BYTES> {
+    type Config = LtEqV1Config<F, N_BYTES>;
     type Loaded = ();
 
     fn config(&self) -> &Self::Config {
@@ -204,7 +204,7 @@ impl<F: Field, const N_BYTES: usize> Chip<F> for LtEqChip<F, N_BYTES> {
 
 #[cfg(test)]
 mod test {
-    use super::{LtEqChip, LtEqConfig, LtEqInstruction};
+    use super::{LtEqV1Chip, LtEqV1Config, LtEqV1Insttruction};
     use eth_types::Field;
     use halo2_proofs::{
         arithmetic::FieldExt,
@@ -260,7 +260,7 @@ mod test {
             value: Column<Advice>,
             value1: Column<Advice>,
             check: Column<Advice>,
-            lt: LtEqConfig<F, 8>,
+            lt: LtEqV1Config<F, 8>,
         }
 
         #[derive(Default)]
@@ -286,7 +286,7 @@ mod test {
                 let value1 = meta.advice_column();
                 let check = meta.advice_column();
 
-                let lt = LtEqChip::configure(
+                let lt = LtEqV1Chip::configure(
                     meta,
                     |meta| meta.query_selector(q_enable),
                     |meta| meta.query_advice(value, Rotation::prev()),
@@ -321,7 +321,7 @@ mod test {
                 config: Self::Config,
                 mut layouter: impl Layouter<F>,
             ) -> Result<(), Error> {
-                let chip = LtEqChip::construct(config.lt);
+                let chip = LtEqV1Chip::construct(config.lt);
 
                 let values: Vec<_> = self
                     .values
