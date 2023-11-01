@@ -14,7 +14,7 @@ use super::{
 };
 
 /// Instruction that the Lt chip needs to implement.
-pub trait LtEqV1Insttruction<F: FieldExt> {
+pub trait LtEqV1Instruction<F: FieldExt> {
     /// Assign the lhs and rhs witnesses to the Lt chip's region.
     fn assign(
         &self,
@@ -124,7 +124,7 @@ impl<F: Field, const N_BYTES: usize> LtEqV1Chip<F, N_BYTES> {
     }
 }
 
-impl<F: Field, const N_BYTES: usize> LtEqV1Insttruction<F> for LtEqV1Chip<F, N_BYTES> {
+impl<F: Field, const N_BYTES: usize> LtEqV1Instruction<F> for LtEqV1Chip<F, N_BYTES> {
     fn assign(
         &self,
         region: &mut Region<'_, F>,
@@ -204,7 +204,7 @@ impl<F: Field, const N_BYTES: usize> Chip<F> for LtEqV1Chip<F, N_BYTES> {
 
 #[cfg(test)]
 mod test {
-    use super::{LtEqV1Chip, LtEqV1Config, LtEqV1Insttruction};
+    use super::{LtEqV1Chip, LtEqV1Config, LtEqV1Instruction};
     use eth_types::Field;
     use halo2_proofs::{
         arithmetic::FieldExt,
