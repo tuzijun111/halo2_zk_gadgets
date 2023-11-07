@@ -2,7 +2,6 @@
 
 use eth_types::Field;
 use halo2_proofs::{
-    arithmetic::FieldExt,
     circuit::{Chip, Layouter, Region, Value},
     plonk::{Advice, Column, ConstraintSystem, Error, Expression, Fixed, VirtualCells},
     poly::Rotation,
@@ -14,7 +13,7 @@ use super::{
 };
 
 /// Instruction that the Lt chip needs to implement.
-pub trait LtEqInstruction<F: FieldExt> {
+pub trait LtEqInstruction<F: Field> {
     /// Assign the lhs and rhs witnesses to the Lt chip's region.
     fn assign(
         &self,
@@ -181,7 +180,7 @@ mod test {
     use super::{LtEqChip, LtEqConfig, LtEqInstruction};
     use eth_types::Field;
     use halo2_proofs::{
-        arithmetic::FieldExt,
+        arithmetic::Field,
         circuit::{Layouter, SimpleFloorPlanner, Value},
         dev::MockProver,
         halo2curves::bn256::Fr as Fp,
@@ -235,7 +234,7 @@ mod test {
         }
 
         #[derive(Default)]
-        struct TestCircuit<F: FieldExt> {
+        struct TestCircuit<F: Field> {
             values: Option<Vec<u64>>,
             // checks[i] = lt(values[i + 1], values[i])
             checks: Option<Vec<bool>>,
@@ -355,7 +354,7 @@ mod test {
         }
 
         #[derive(Default)]
-        struct TestCircuit<F: FieldExt> {
+        struct TestCircuit<F: Field> {
             values: Option<Vec<(u64, u64)>>,
             // checks[i] = lt(values[i].0 - values[i].1)
             checks: Option<Vec<bool>>,
