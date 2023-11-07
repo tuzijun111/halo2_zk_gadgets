@@ -1,9 +1,10 @@
 //! Types needed for generating Ethereum traces
 
 use crate::{
+    keccak256,
     sign_types::{biguint_to_32bytes_le, ct_option_ok_or, recover_pk, SignData, SECP256K1_Q},
-    AccessList, Address, Block, Bytes, Error, GethExecTrace, Hash, ToBigEndian, ToLittleEndian,
-    Word, U64,
+    AccessList, Address, Block, Bytecode, Bytes, Error, GethExecTrace, Hash, ToBigEndian,
+    ToLittleEndian, ToWord, Word, U64,
 };
 use ethers_core::{
     types::{transaction::response, NameOrAddress, TransactionRequest},
@@ -15,7 +16,6 @@ use num::Integer;
 use num_bigint::BigUint;
 use serde::{Serialize, Serializer};
 use serde_with::serde_as;
-use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
 
 /// Definition of all of the data related to an account.
@@ -24,8 +24,9 @@ use std::collections::HashMap;
 pub struct Account {
     /// Address
     pub address: Address,
-    /// nonce
-    pub nonce: Word,
+    /// Nonce.
+    /// U64 type is required to serialize into proper hex with 0x prefix
+    pub nonce: U64,
     /// Balance
     pub balance: Word,
     /// EVM Code
@@ -42,6 +43,28 @@ impl Account {
             && self.balance.is_zero()
             && self.code.is_empty()
             && self.storage.is_empty()
+    }
+
+    /// Generate an account that is either empty or has code, balance, and non-zero nonce
+    pub fn mock_code_balance(code: Bytecode) -> Self {
+        let is_empty = code.codesize() == 0;
+        Self {
+            address: Address::repeat_byte(0xff),
+            code: code.into(),
+            nonce: U64::from(!is_empty as u64),
+            balance: if is_empty { 0 } else { 0xdeadbeefu64 }.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Generate an account that has 100 ETH
+    pub fn mock_100_ether(code: Bytecode) -> Self {
+        Self {
+            address: Address::repeat_byte(0xfe),
+            balance: Word::from(10).pow(20.into()),
+            code: code.into(),
+            ..Default::default()
+        }
     }
 }
 
@@ -64,7 +87,8 @@ pub struct BlockConstants {
     pub coinbase: Address,
     /// time
     pub timestamp: Word,
-    /// number
+    /// Block number
+    /// U64 type is required to serialize into proper hex with 0x prefix
     pub number: U64,
     /// difficulty
     pub difficulty: Word,
@@ -82,7 +106,11 @@ impl<TX> TryFrom<&Block<TX>> for BlockConstants {
             coinbase: block.author.ok_or(Error::IncompleteBlock)?,
             timestamp: block.timestamp,
             number: block.number.ok_or(Error::IncompleteBlock)?,
-            difficulty: block.difficulty,
+            difficulty: if block.difficulty.is_zero() {
+                block.mix_hash.unwrap_or_default().to_fixed_bytes().into()
+            } else {
+                block.difficulty
+            },
             gas_limit: block.gas_limit,
             base_fee: block.base_fee_per_gas.ok_or(Error::IncompleteBlock)?,
         })
@@ -110,6 +138,20 @@ impl BlockConstants {
     }
 }
 
+/// Definition of all of the constants related to an Ethereum withdrawal.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct Withdrawal {
+    /// Unique identifier of a withdrawal. This value starts from 0 and then increases
+    /// monotonically.
+    pub id: u64,
+    /// Unique identifier of a validator.
+    pub validator_id: u64,
+    /// Address to be withdrawn to.
+    pub address: Address,
+    /// Withdrawal amount in Gwei.
+    pub amount: u64,
+}
+
 /// Definition of all of the constants related to an Ethereum transaction.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Transaction {
@@ -119,9 +161,11 @@ pub struct Transaction {
     /// Avoid direct read from this field. We set this field public to construct the struct
     pub to: Option<Address>,
     /// Transaction nonce
-    pub nonce: Word,
+    /// U64 type is required to serialize into proper hex with 0x prefix
+    pub nonce: U64,
     /// Gas Limit / Supplied gas
-    pub gas_limit: Word,
+    /// U64 type is required to serialize into proper hex with 0x prefix
+    pub gas_limit: U64,
     /// Transfered value
     pub value: Word,
     /// Gas Price
@@ -150,12 +194,12 @@ impl From<&Transaction> for crate::Transaction {
         crate::Transaction {
             from: tx.from,
             to: tx.to,
-            nonce: tx.nonce,
-            gas: tx.gas_limit,
+            nonce: tx.nonce.to_word(),
+            gas: tx.gas_limit.to_word(),
             value: tx.value,
             gas_price: Some(tx.gas_price),
-            max_priority_fee_per_gas: Some(tx.gas_fee_cap),
-            max_fee_per_gas: Some(tx.gas_tip_cap),
+            max_priority_fee_per_gas: Some(tx.gas_tip_cap),
+            max_fee_per_gas: Some(tx.gas_fee_cap),
             input: tx.call_data.clone(),
             access_list: tx.access_list.clone(),
             v: tx.v.into(),
@@ -171,12 +215,12 @@ impl From<&crate::Transaction> for Transaction {
         Transaction {
             from: tx.from,
             to: tx.to,
-            nonce: tx.nonce,
-            gas_limit: tx.gas,
+            nonce: tx.nonce.as_u64().into(),
+            gas_limit: tx.gas.as_u64().into(),
             value: tx.value,
             gas_price: tx.gas_price.unwrap_or_default(),
-            gas_fee_cap: tx.max_priority_fee_per_gas.unwrap_or_default(),
-            gas_tip_cap: tx.max_fee_per_gas.unwrap_or_default(),
+            gas_tip_cap: tx.max_priority_fee_per_gas.unwrap_or_default(),
+            gas_fee_cap: tx.max_fee_per_gas.unwrap_or_default(),
             call_data: tx.input.clone(),
             access_list: tx.access_list.clone(),
             v: tx.v.as_u64(),
@@ -191,11 +235,11 @@ impl From<&Transaction> for TransactionRequest {
         TransactionRequest {
             from: Some(tx.from),
             to: tx.to.map(NameOrAddress::Address),
-            gas: Some(tx.gas_limit),
+            gas: Some(tx.gas_limit.to_word()),
             gas_price: Some(tx.gas_price),
             value: Some(tx.value),
             data: Some(tx.call_data.clone()),
-            nonce: Some(tx.nonce),
+            nonce: Some(tx.nonce.to_word()),
             ..Default::default()
         }
     }
@@ -217,11 +261,7 @@ impl Transaction {
         // msg = rlp([nonce, gasPrice, gas, to, value, data, sig_v, r, s])
         let req: TransactionRequest = self.into();
         let msg = req.chain_id(chain_id).rlp();
-        let msg_hash: [u8; 32] = Keccak256::digest(&msg)
-            .as_slice()
-            .to_vec()
-            .try_into()
-            .expect("hash length isn't 32 bytes");
+        let msg_hash: [u8; 32] = keccak256(&msg);
         let v = self
             .v
             .checked_sub(35 + chain_id * 2)
@@ -249,14 +289,14 @@ impl Transaction {
             .fold(0, |acc, byte| acc + if *byte == 0 { 4 } else { 16 })
     }
 
-    /// Get the "to" address. If `to` is None then zero adddress
+    /// Get the "to" address. If `to` is None then zero address
     pub fn to_or_zero(&self) -> Address {
         self.to.unwrap_or_default()
     }
-    /// Get the "to" address. If `to` is None then compute contract adddress
+    /// Get the "to" address. If `to` is None then compute contract address
     pub fn to_or_contract_addr(&self) -> Address {
         self.to
-            .unwrap_or_else(|| get_contract_address(self.from, self.nonce))
+            .unwrap_or_else(|| get_contract_address(self.from, self.nonce.to_word()))
     }
     /// Determine if this transaction is a contract create transaction
     pub fn is_create(&self) -> bool {
@@ -277,8 +317,8 @@ impl Transaction {
             input: self.call_data.clone(),
             gas_price: Some(self.gas_price),
             access_list: self.access_list.clone(),
-            nonce: self.nonce,
-            gas: self.gas_limit,
+            nonce: self.nonce.to_word(),
+            gas: self.gas_limit.to_word(),
             transaction_index: Some(transaction_index),
             r: self.r,
             s: self.s,
@@ -288,6 +328,10 @@ impl Transaction {
             ..response::Transaction::default()
         }
     }
+    /// Convinient method for gas limit
+    pub fn gas(&self) -> u64 {
+        self.gas_limit.as_u64()
+    }
 }
 
 /// GethData is a type that contains all the information of a Ethereum block
@@ -296,7 +340,7 @@ pub struct GethData {
     /// chain id
     pub chain_id: Word,
     /// history hashes contains most recent 256 block hashes in history, where
-    /// the lastest one is at history_hashes[history_hashes.len() - 1].
+    /// the latest one is at history_hashes[history_hashes.len() - 1].
     pub history_hashes: Vec<Word>,
     /// Block from geth
     pub eth_block: Block<crate::Transaction>,
@@ -314,7 +358,9 @@ impl GethData {
             assert_eq!(Word::from(wallet.chain_id()), self.chain_id);
             let geth_tx: Transaction = (&*tx).into();
             let req: TransactionRequest = (&geth_tx).into();
-            let sig = wallet.sign_transaction_sync(&req.chain_id(self.chain_id.as_u64()).into());
+            let sig = wallet
+                .sign_transaction_sync(&req.chain_id(self.chain_id.as_u64()).into())
+                .unwrap();
             tx.v = U64::from(sig.v);
             tx.r = sig.r;
             tx.s = sig.s;
