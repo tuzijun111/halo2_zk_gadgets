@@ -126,23 +126,33 @@ type TraceConfig struct {
 
 func newUint64(val uint64) *uint64 { return &val }
 
+func toBigInt(value *hexutil.Big) *big.Int {
+	if value != nil {
+		return value.ToInt()
+	}
+	return big.NewInt(0)
+}
+
 func Trace(config TraceConfig) ([]*ExecutionResult, error) {
 	chainConfig := params.ChainConfig{
-		ChainID:             toBigInt(config.ChainID),
-		HomesteadBlock:      big.NewInt(0),
-		DAOForkBlock:        big.NewInt(0),
-		DAOForkSupport:      true,
-		EIP150Block:         big.NewInt(0),
-		EIP150Hash:          common.Hash{},
-		EIP155Block:         big.NewInt(0),
-		EIP158Block:         big.NewInt(0),
-		ByzantiumBlock:      big.NewInt(0),
-		ConstantinopleBlock: big.NewInt(0),
-		PetersburgBlock:     big.NewInt(0),
-		IstanbulBlock:       big.NewInt(0),
-		MuirGlacierBlock:    big.NewInt(0),
-		BerlinBlock:         big.NewInt(0),
-		LondonBlock:         big.NewInt(0),
+		ChainID:                       toBigInt(config.ChainID),
+		HomesteadBlock:                big.NewInt(0),
+		DAOForkBlock:                  big.NewInt(0),
+		DAOForkSupport:                true,
+		EIP150Block:                   big.NewInt(0),
+		EIP150Hash:                    common.Hash{},
+		EIP155Block:                   big.NewInt(0),
+		EIP158Block:                   big.NewInt(0),
+		ByzantiumBlock:                big.NewInt(0),
+		ConstantinopleBlock:           big.NewInt(0),
+		PetersburgBlock:               big.NewInt(0),
+		IstanbulBlock:                 big.NewInt(0),
+		MuirGlacierBlock:              big.NewInt(0),
+		BerlinBlock:                   big.NewInt(0),
+		LondonBlock:                   big.NewInt(0),
+		ShanghaiTime:                  newUint64(0),
+		TerminalTotalDifficulty:       big.NewInt(0),
+		TerminalTotalDifficultyPassed: true,
 	}
 
 	var txsGasLimit uint64
@@ -161,16 +171,16 @@ func Trace(config TraceConfig) ([]*ExecutionResult, error) {
 			txAccessList[i].StorageKeys = accessList.StorageKeys
 		}
 		messages[i] = core.Message{
-			From: tx.From,
-			To: tx.To,
-			Nonce: uint64(tx.Nonce),
-			Value: toBigInt(tx.Value),
-			GasLimit: uint64(tx.GasLimit),
-			GasPrice: toBigInt(tx.GasPrice),
-			GasFeeCap: toBigInt(tx.GasFeeCap),
-			GasTipCap: toBigInt(tx.GasTipCap),
-			Data: tx.CallData,
-			AccessList: txAccessList,
+			From:              tx.From,
+			To:                tx.To,
+			Nonce:             uint64(tx.Nonce),
+			Value:             toBigInt(tx.Value),
+			GasLimit:          uint64(tx.GasLimit),
+			GasPrice:          toBigInt(tx.GasPrice),
+			GasFeeCap:         toBigInt(tx.GasFeeCap),
+			GasTipCap:         toBigInt(tx.GasTipCap),
+			Data:              tx.CallData,
+			AccessList:        txAccessList,
 			SkipAccountChecks: false,
 		}
 
@@ -179,6 +189,10 @@ func Trace(config TraceConfig) ([]*ExecutionResult, error) {
 	if txsGasLimit > blockGasLimit {
 		return nil, fmt.Errorf("txs total gas: %d Exceeds block gas limit: %d", txsGasLimit, blockGasLimit)
 	}
+
+	// For opcode PREVRANDAO
+	// Difficulty is one of MixHash or Difficulty.
+	randao := common.BigToHash(toBigInt(config.Block.Difficulty))
 
 	blockCtx := vm.BlockContext{
 		CanTransfer: core.CanTransfer,
@@ -195,6 +209,7 @@ func Trace(config TraceConfig) ([]*ExecutionResult, error) {
 		BlockNumber: toBigInt(config.Block.Number),
 		Time:        toBigInt(config.Block.Timestamp).Uint64(),
 		Difficulty:  toBigInt(config.Block.Difficulty),
+		Random:      &randao,
 		BaseFee:     toBigInt(config.Block.BaseFee),
 		GasLimit:    blockGasLimit,
 	}

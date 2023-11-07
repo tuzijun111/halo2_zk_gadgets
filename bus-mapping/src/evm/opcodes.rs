@@ -1,16 +1,13 @@
 //! Definition of each opcode of the EVM.
 use crate::{
     circuit_input_builder::{CircuitInputStateRef, ExecState, ExecStep},
-    error::{ExecError, OogError},
+    error::{DepthError, ExecError, InsufficientBalanceError, NonceUintOverflowError, OogError},
     evm::OpcodeId,
-    operation::TxAccessListAccountOp,
+    operation::{AccountField, AccountOp, TxAccessListAccountOp},
     Error,
 };
 use core::fmt::Debug;
-use eth_types::{evm_unimplemented, GethExecStep, ToAddress};
-
-#[cfg(any(feature = "test", test))]
-pub use self::sha3::sha3_tests::{gen_sha3_code, MemoryKind};
+use eth_types::{evm_unimplemented, GethExecStep, ToAddress, ToWord, Word};
 
 mod address;
 mod balance;
@@ -47,7 +44,10 @@ mod stackonlyop;
 mod stop;
 mod swap;
 
+mod error_code_store;
+mod error_invalid_creation_code;
 mod error_invalid_jump;
+mod error_oog_account_access;
 mod error_oog_call;
 mod error_oog_exp;
 mod error_oog_log;
@@ -72,9 +72,12 @@ use callop::CallOpcode;
 use callvalue::Callvalue;
 use codecopy::Codecopy;
 use codesize::Codesize;
-use create::DummyCreate;
+use create::Create;
 use dup::Dup;
+use error_code_store::ErrorCodeStore;
+use error_invalid_creation_code::ErrorCreationCode;
 use error_invalid_jump::InvalidJump;
+use error_oog_account_access::ErrorOOGAccountAccess;
 use error_oog_call::OOGCall;
 use error_oog_exp::OOGExp;
 use error_oog_log::ErrorOOGLog;
@@ -144,12 +147,13 @@ type FnGenAssociatedOps = fn(
 ) -> Result<Vec<ExecStep>, Error>;
 
 fn fn_gen_associated_ops(opcode_id: &OpcodeId) -> FnGenAssociatedOps {
-    if opcode_id.is_push() {
+    if opcode_id.is_push_with_data() {
         return StackOnlyOpcode::<0, 1>::gen_associated_ops;
     }
 
     match opcode_id {
         OpcodeId::STOP => Stop::gen_associated_ops,
+        OpcodeId::PUSH0 => StackOnlyOpcode::<0, 1>::gen_associated_ops,
         OpcodeId::ADD => StackOnlyOpcode::<2, 1>::gen_associated_ops,
         OpcodeId::MUL => StackOnlyOpcode::<2, 1>::gen_associated_ops,
         OpcodeId::SUB => StackOnlyOpcode::<2, 1>::gen_associated_ops,
@@ -252,18 +256,12 @@ fn fn_gen_associated_ops(opcode_id: &OpcodeId) -> FnGenAssociatedOps {
         OpcodeId::LOG4 => Log::gen_associated_ops,
         OpcodeId::CALL | OpcodeId::CALLCODE => CallOpcode::<7>::gen_associated_ops,
         OpcodeId::DELEGATECALL | OpcodeId::STATICCALL => CallOpcode::<6>::gen_associated_ops,
+        OpcodeId::CREATE => Create::<false>::gen_associated_ops,
+        OpcodeId::CREATE2 => Create::<true>::gen_associated_ops,
         OpcodeId::RETURN | OpcodeId::REVERT => ReturnRevert::gen_associated_ops,
         OpcodeId::SELFDESTRUCT => {
             evm_unimplemented!("Using dummy gen_selfdestruct_ops for opcode SELFDESTRUCT");
             DummySelfDestruct::gen_associated_ops
-        }
-        OpcodeId::CREATE => {
-            evm_unimplemented!("Using dummy gen_create_ops for opcode {:?}", opcode_id);
-            DummyCreate::<false>::gen_associated_ops
-        }
-        OpcodeId::CREATE2 => {
-            evm_unimplemented!("Using dummy gen_create_ops for opcode {:?}", opcode_id);
-            DummyCreate::<true>::gen_associated_ops
         }
         _ => {
             evm_unimplemented!("Using dummy gen_associated_ops for opcode {:?}", opcode_id);
@@ -281,23 +279,60 @@ fn fn_gen_error_state_associated_ops(
         ExecError::InvalidOpcode => Some(ErrorSimple::gen_associated_ops),
         ExecError::OutOfGas(OogError::Call) => Some(OOGCall::gen_associated_ops),
         ExecError::OutOfGas(OogError::Constant) => Some(ErrorSimple::gen_associated_ops),
+        ExecError::OutOfGas(OogError::Create) => match geth_step.op {
+            OpcodeId::CREATE => Some(StackOnlyOpcode::<3, 0, true>::gen_associated_ops),
+            OpcodeId::CREATE2 => Some(StackOnlyOpcode::<4, 0, true>::gen_associated_ops),
+            op => unreachable!("OOG Create cannot occur in {op}"),
+        },
         ExecError::OutOfGas(OogError::Exp) => Some(OOGExp::gen_associated_ops),
         ExecError::OutOfGas(OogError::Log) => Some(ErrorOOGLog::gen_associated_ops),
         ExecError::OutOfGas(OogError::MemoryCopy) => Some(OOGMemoryCopy::gen_associated_ops),
+        ExecError::OutOfGas(OogError::DynamicMemoryExpansion) => {
+            Some(StackOnlyOpcode::<2, 0, true>::gen_associated_ops)
+        }
+        ExecError::OutOfGas(OogError::StaticMemoryExpansion) => {
+            Some(StackOnlyOpcode::<1, 0, true>::gen_associated_ops)
+        }
         ExecError::OutOfGas(OogError::SloadSstore) => Some(OOGSloadSstore::gen_associated_ops),
+        ExecError::OutOfGas(OogError::AccountAccess) => {
+            Some(ErrorOOGAccountAccess::gen_associated_ops)
+        }
+        ExecError::OutOfGas(OogError::Sha3) => {
+            Some(StackOnlyOpcode::<2, 0, true>::gen_associated_ops)
+        }
         ExecError::StackOverflow => Some(ErrorSimple::gen_associated_ops),
         ExecError::StackUnderflow => Some(ErrorSimple::gen_associated_ops),
         // call & callcode can encounter InsufficientBalance error, Use pop-7 generic CallOpcode
-        ExecError::InsufficientBalance => Some(CallOpcode::<7>::gen_associated_ops),
+        ExecError::InsufficientBalance(InsufficientBalanceError::Call) => {
+            Some(CallOpcode::<7>::gen_associated_ops)
+        }
+        // create & create2 can encounter insufficient balance.
+        ExecError::InsufficientBalance(InsufficientBalanceError::Create) => {
+            Some(Create::<false>::gen_associated_ops)
+        }
+        ExecError::InsufficientBalance(InsufficientBalanceError::Create2) => {
+            Some(Create::<true>::gen_associated_ops)
+        }
+        // only create2 may cause ContractAddressCollision error, so use Create::<true>.
+        ExecError::ContractAddressCollision => Some(Create::<true>::gen_associated_ops),
+        // create & create2 can encounter nonce uint overflow.
+        ExecError::NonceUintOverflow(NonceUintOverflowError::Create) => {
+            Some(Create::<false>::gen_associated_ops)
+        }
+        ExecError::NonceUintOverflow(NonceUintOverflowError::Create2) => {
+            Some(Create::<true>::gen_associated_ops)
+        }
         ExecError::WriteProtection => Some(ErrorWriteProtection::gen_associated_ops),
         ExecError::ReturnDataOutOfBounds => Some(ErrorReturnDataOutOfBound::gen_associated_ops),
-        ExecError::Depth => {
-            let op = geth_step.op;
-            if !op.is_call() {
-                evm_unimplemented!("TODO: ErrDepth for CREATE is not implemented yet");
-            }
-            Some(fn_gen_associated_ops(&op))
+        ExecError::InvalidCreationCode => Some(ErrorCreationCode::gen_associated_ops),
+        // call, callcode, create & create2 can encounter DepthError error,
+        ExecError::Depth(DepthError::Call) => Some(CallOpcode::<7>::gen_associated_ops),
+        ExecError::Depth(DepthError::Create) => Some(Create::<false>::gen_associated_ops),
+        ExecError::Depth(DepthError::Create2) => Some(Create::<true>::gen_associated_ops),
+        ExecError::CodeStoreOutOfGas | ExecError::MaxCodeSizeExceeded => {
+            Some(ErrorCodeStore::gen_associated_ops)
         }
+
         // more future errors place here
         _ => {
             evm_unimplemented!("TODO: error state {:?} not implemented", error);
@@ -412,23 +447,60 @@ fn dummy_gen_selfdestruct_ops(
         },
     )?;
 
-    let (found, _) = state.sdb.get_account(&receiver);
+    let (found, receiver_account) = state.sdb.get_account(&receiver);
     if !found {
         return Err(Error::AccountNotFound(receiver));
     }
+    let receiver_account = &receiver_account.clone();
     let (found, sender_account) = state.sdb.get_account(&sender);
     if !found {
         return Err(Error::AccountNotFound(sender));
     }
+    let sender_account = &sender_account.clone();
     let value = sender_account.balance;
-    // NOTE: In this dummy implementation we assume that the receiver already
-    // exists.
-    state.transfer(&mut exec_step, sender, receiver, true, false, value)?;
+
+    state.push_op_reversible(
+        &mut exec_step,
+        AccountOp {
+            address: sender,
+            field: AccountField::Balance,
+            value: Word::zero(),
+            value_prev: value,
+        },
+    )?;
+    state.push_op_reversible(
+        &mut exec_step,
+        AccountOp {
+            address: sender,
+            field: AccountField::Nonce,
+            value: Word::zero(),
+            value_prev: sender_account.nonce.into(),
+        },
+    )?;
+    state.push_op_reversible(
+        &mut exec_step,
+        AccountOp {
+            address: sender,
+            field: AccountField::CodeHash,
+            value: Word::zero(),
+            value_prev: sender_account.code_hash.to_word(),
+        },
+    )?;
+    if receiver != sender {
+        state.transfer_to(
+            &mut exec_step,
+            receiver,
+            !receiver_account.is_empty(),
+            false,
+            value,
+            true,
+        )?;
+    }
 
     if state.call()?.is_persistent {
         state.sdb.destruct_account(sender);
     }
 
-    state.handle_return(&mut exec_step, geth_steps, false)?;
+    state.handle_return(&mut exec_step, geth_steps, !state.call()?.is_root)?;
     Ok(vec![exec_step])
 }

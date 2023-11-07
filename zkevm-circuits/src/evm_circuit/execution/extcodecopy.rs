@@ -8,31 +8,39 @@ use crate::{
                 ConstrainBuilderCommon, EVMConstraintBuilder, ReversionInfo, StepStateTransition,
                 Transition,
             },
-            from_bytes,
-            memory_gadget::{MemoryAddressGadget, MemoryCopierGasGadget, MemoryExpansionGadget},
-            not, select, CachedRegion, Cell, Word,
+            math_gadget::IsZeroWordGadget,
+            memory_gadget::{
+                CommonMemoryAddressGadget, MemoryAddressGadget, MemoryCopierGasGadget,
+                MemoryExpansionGadget,
+            },
+            not, select, AccountAddress, CachedRegion, Cell,
         },
         witness::{Block, Call, ExecStep, Transaction},
     },
     table::{AccountFieldTag, CallContextFieldTag},
+    util::word::{Word, Word32Cell, WordExpr},
 };
 use bus_mapping::circuit_input_builder::CopyDataType;
-use eth_types::{evm_types::GasCost, Field, ToLittleEndian, ToScalar};
+use eth_types::{evm_types::GasCost, Field, ToScalar};
 use gadgets::util::Expr;
-use halo2_proofs::{circuit::Value, plonk::Error};
+use halo2_proofs::{
+    circuit::Value,
+    plonk::{Error, Expression},
+};
 
 use super::ExecutionGadget;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExtcodecopyGadget<F> {
     same_context: SameContextGadget<F>,
-    external_address_word: Word<F>,
+    external_address_word: Word32Cell<F>,
     memory_address: MemoryAddressGadget<F>,
     code_offset: WordByteCapGadget<F, N_BYTES_U64>,
     tx_id: Cell<F>,
     reversion_info: ReversionInfo<F>,
     is_warm: Cell<F>,
-    code_hash: Cell<F>,
+    code_hash: Word32Cell<F>,
+    not_exists: IsZeroWordGadget<F, Word<Expression<F>>>,
     code_size: Cell<F>,
     copy_rwc_inc: Cell<F>,
     memory_expansion: MemoryExpansionGadget<F, 1, N_BYTES_MEMORY_WORD_SIZE>,
@@ -47,43 +55,50 @@ impl<F: Field> ExecutionGadget<F> for ExtcodecopyGadget<F> {
     fn configure(cb: &mut EVMConstraintBuilder<F>) -> Self {
         let opcode = cb.query_cell();
 
-        let external_address_word = cb.query_word_rlc();
-        let external_address =
-            from_bytes::expr(&external_address_word.cells[..N_BYTES_ACCOUNT_ADDRESS]);
+        let external_address_word = cb.query_word32();
+        let external_address = AccountAddress::new(
+            external_address_word.limbs[..N_BYTES_ACCOUNT_ADDRESS]
+                .to_vec()
+                .try_into()
+                .unwrap(),
+        );
 
         let code_size = cb.query_cell();
 
-        let memory_length = cb.query_word_rlc();
-        let memory_offset = cb.query_cell_phase2();
+        let memory_length = cb.query_memory_address();
+        let memory_offset = cb.query_word_unchecked();
         let code_offset = WordByteCapGadget::construct(cb, code_size.expr());
 
-        cb.stack_pop(external_address_word.expr());
-        cb.stack_pop(memory_offset.expr());
-        cb.stack_pop(code_offset.original_word());
-        cb.stack_pop(memory_length.expr());
+        cb.stack_pop(external_address_word.to_word());
+        cb.stack_pop(memory_offset.to_word());
+        cb.stack_pop(code_offset.original_word().to_word());
+        cb.stack_pop(memory_length.to_word());
 
         let tx_id = cb.call_context(None, CallContextFieldTag::TxId);
         let mut reversion_info = cb.reversion_info_read(None);
         let is_warm = cb.query_bool();
-        cb.account_access_list_write(
+        cb.account_access_list_write_unchecked(
             tx_id.expr(),
-            external_address.expr(),
+            external_address.to_word(),
             1.expr(),
             is_warm.expr(),
             Some(&mut reversion_info),
         );
 
-        let code_hash = cb.query_cell_phase2();
+        let code_hash = cb.query_word32();
         cb.account_read(
-            external_address.expr(),
+            external_address.to_word(),
             AccountFieldTag::CodeHash,
-            code_hash.expr(),
+            code_hash.to_word(),
         );
-        // TODO: If external_address doesn't exist, we will get code_hash = 0.  With
-        // this value, the bytecode_length lookup will not work, and the copy
-        // from code_hash = 0 will not work. We should use EMPTY_HASH when
-        // code_hash = 0.
-        cb.bytecode_length(code_hash.expr(), code_size.expr());
+        let not_exists = IsZeroWordGadget::construct(cb, &code_hash.to_word());
+        let exists = not::expr(not_exists.expr());
+        cb.condition(exists.expr(), |cb| {
+            cb.bytecode_length(code_hash.to_word(), code_size.expr());
+        });
+        cb.condition(not_exists.expr(), |cb| {
+            cb.require_zero("code_size is zero when non_exists", code_size.expr());
+        });
 
         let memory_address = MemoryAddressGadget::construct(cb, memory_offset, memory_length);
         let memory_expansion = MemoryExpansionGadget::construct(cb, [memory_address.address()]);
@@ -109,9 +124,9 @@ impl<F: Field> ExecutionGadget<F> for ExtcodecopyGadget<F> {
             );
 
             cb.copy_table_lookup(
-                code_hash.expr(),
+                code_hash.to_word(),
                 CopyDataType::Bytecode.expr(),
-                cb.curr.state.call_id.expr(),
+                Word::from_lo_unchecked(cb.curr.state.call_id.expr()),
                 CopyDataType::Memory.expr(),
                 src_addr,
                 code_size.expr(),
@@ -148,6 +163,7 @@ impl<F: Field> ExecutionGadget<F> for ExtcodecopyGadget<F> {
             is_warm,
             reversion_info,
             code_hash,
+            not_exists,
             code_size,
             copy_rwc_inc,
             memory_expansion,
@@ -167,15 +183,15 @@ impl<F: Field> ExecutionGadget<F> for ExtcodecopyGadget<F> {
         self.same_context.assign_exec_step(region, offset, step)?;
 
         let [external_address, memory_offset, code_offset, memory_length] =
-            [0, 1, 2, 3].map(|idx| block.rws[step.rw_indices[idx]].stack_value());
+            [0, 1, 2, 3].map(|idx| block.get_rws(step, idx).stack_value());
         self.external_address_word
-            .assign(region, offset, Some(external_address.to_le_bytes()))?;
+            .assign_u256(region, offset, external_address)?;
         let memory_address =
             self.memory_address
                 .assign(region, offset, memory_offset, memory_length)?;
 
         self.tx_id
-            .assign(region, offset, Value::known(F::from(transaction.id as u64)))?;
+            .assign(region, offset, Value::known(F::from(transaction.id)))?;
         self.reversion_info.assign(
             region,
             offset,
@@ -183,23 +199,22 @@ impl<F: Field> ExecutionGadget<F> for ExtcodecopyGadget<F> {
             call.is_persistent,
         )?;
 
-        let (_, is_warm) = block.rws[step.rw_indices[7]].tx_access_list_value_pair();
+        let (_, is_warm) = block.get_rws(step, 7).tx_access_list_value_pair();
         self.is_warm
             .assign(region, offset, Value::known(F::from(is_warm as u64)))?;
 
-        let code_hash = block.rws[step.rw_indices[8]].account_value_pair().0;
-        self.code_hash
-            .assign(region, offset, region.word_rlc(code_hash))?;
+        let code_hash = block.get_rws(step, 8).account_codehash_pair().0;
+        self.code_hash.assign_u256(region, offset, code_hash)?;
+        self.not_exists.assign_u256(region, offset, code_hash)?;
 
         let code_size = if code_hash.is_zero() {
             0
         } else {
             block
                 .bytecodes
-                .get(&code_hash)
+                .get_from_u256(&code_hash)
                 .expect("could not find external bytecode")
-                .bytes
-                .len() as u64
+                .codesize() as u64
         };
         self.code_size
             .assign(region, offset, Value::known(F::from(code_size)))?;
@@ -252,7 +267,7 @@ mod test {
     fn test_ok(
         external_account: Option<Account>,
         code_offset: Word,
-        memory_offset: usize,
+        memory_offset: Word,
         length: usize,
         is_warm: bool,
     ) {
@@ -291,10 +306,7 @@ mod test {
                     .balance(Word::from(1u64 << 20));
                 accs[2].address(external_address);
                 if let Some(external_account) = external_account {
-                    accs[2]
-                        .balance(external_account.balance)
-                        .nonce(external_account.nonce)
-                        .code(external_account.code);
+                    accs[2].account(&external_account);
                 }
             },
             |mut txs, accs| {
@@ -312,8 +324,8 @@ mod test {
 
     #[test]
     fn extcodecopy_empty_account() {
-        test_ok(None, 0x00.into(), 0x00, 0x36, true); // warm account
-        test_ok(None, 0x00.into(), 0x00, 0x36, false); // cold account
+        test_ok(None, Word::zero(), Word::zero(), 0x36, true); // warm account
+        test_ok(None, Word::zero(), Word::zero(), 0x36, false); // cold account
     }
 
     #[test]
@@ -324,8 +336,8 @@ mod test {
                 code: Bytes::from([10, 40]),
                 ..Default::default()
             }),
-            0x00.into(),
-            0x00,
+            Word::zero(),
+            Word::zero(),
             0x36,
             true,
         ); // warm account
@@ -336,8 +348,8 @@ mod test {
                 code: Bytes::from([10, 40]),
                 ..Default::default()
             }),
-            0x00.into(),
-            0x00,
+            Word::zero(),
+            Word::zero(),
             0x36,
             false,
         ); // cold account
@@ -351,8 +363,8 @@ mod test {
                 code: Bytes::from(rand_bytes_array::<256>()),
                 ..Default::default()
             }),
-            0x00.into(),
-            0x00,
+            Word::zero(),
+            Word::zero(),
             0x36,
             true,
         );
@@ -362,8 +374,8 @@ mod test {
                 code: Bytes::from(rand_bytes_array::<256>()),
                 ..Default::default()
             }),
-            0x00.into(),
-            0x00,
+            Word::zero(),
+            Word::zero(),
             0x36,
             false,
         );
@@ -378,7 +390,7 @@ mod test {
                 ..Default::default()
             }),
             0x20.into(),
-            0x00,
+            Word::zero(),
             0x104,
             true,
         );
@@ -389,7 +401,7 @@ mod test {
                 ..Default::default()
             }),
             0x20.into(),
-            0x00,
+            Word::zero(),
             0x104,
             false,
         );
@@ -404,7 +416,7 @@ mod test {
                 ..Default::default()
             }),
             Word::MAX,
-            0x00,
+            Word::zero(),
             0x36,
             true,
         );
@@ -415,9 +427,35 @@ mod test {
                 ..Default::default()
             }),
             Word::MAX,
-            0x00,
+            Word::zero(),
             0x36,
             false,
+        );
+    }
+
+    #[test]
+    fn extcodecopy_overflow_memory_offset_and_zero_length() {
+        test_ok(
+            Some(Account {
+                address: *EXTERNAL_ADDRESS,
+                code: Bytes::from(rand_bytes_array::<256>()),
+                ..Default::default()
+            }),
+            0x20.into(),
+            Word::MAX,
+            0,
+            true,
+        );
+        test_ok(
+            Some(Account {
+                address: *EXTERNAL_ADDRESS,
+                code: Bytes::from(rand_bytes_array::<256>()),
+                ..Default::default()
+            }),
+            0x20.into(),
+            Word::MAX,
+            0,
+            true,
         );
     }
 }

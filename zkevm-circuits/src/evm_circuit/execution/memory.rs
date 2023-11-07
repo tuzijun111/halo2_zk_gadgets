@@ -1,7 +1,7 @@
 use crate::{
     evm_circuit::{
         execution::ExecutionGadget,
-        param::{N_BYTES_MEMORY_ADDRESS, N_BYTES_MEMORY_WORD_SIZE},
+        param::N_BYTES_MEMORY_WORD_SIZE,
         step::ExecutionState,
         util::{
             common_gadget::SameContextGadget,
@@ -9,23 +9,25 @@ use crate::{
                 EVMConstraintBuilder, StepStateTransition,
                 Transition::{Delta, To},
             },
-            from_bytes,
             math_gadget::IsEqualGadget,
             memory_gadget::MemoryExpansionGadget,
-            not, CachedRegion, MemoryAddress, Word,
+            not, CachedRegion, MemoryAddress,
         },
         witness::{Block, Call, ExecStep, Transaction},
     },
-    util::Expr,
+    util::{
+        word::{Word32Cell, WordExpr},
+        Expr,
+    },
 };
-use eth_types::{evm_types::OpcodeId, Field, ToLittleEndian};
+use eth_types::{evm_types::OpcodeId, Field};
 use halo2_proofs::plonk::Error;
 
 #[derive(Clone, Debug)]
 pub(crate) struct MemoryGadget<F> {
     same_context: SameContextGadget<F>,
     address: MemoryAddress<F>,
-    value: Word<F>,
+    value: Word32Cell<F>,
     memory_expansion: MemoryExpansionGadget<F, 1, N_BYTES_MEMORY_WORD_SIZE>,
     is_mload: IsEqualGadget<F>,
     is_mstore8: IsEqualGadget<F>,
@@ -40,8 +42,8 @@ impl<F: Field> ExecutionGadget<F> for MemoryGadget<F> {
         let opcode = cb.query_cell();
 
         // In successful case the address must be in 5 bytes
-        let address = cb.query_word_rlc();
-        let value = cb.query_word_rlc();
+        let address = cb.query_memory_address();
+        let value = cb.query_word32();
 
         // Check if this is an MLOAD
         let is_mload = IsEqualGadget::construct(cb, opcode.expr(), OpcodeId::MLOAD.expr());
@@ -56,35 +58,30 @@ impl<F: Field> ExecutionGadget<F> for MemoryGadget<F> {
         // access
         let memory_expansion = MemoryExpansionGadget::construct(
             cb,
-            [from_bytes::expr(&address.cells) + 1.expr() + (is_not_mstore8.clone() * 31.expr())],
+            [address.expr() + 1.expr() + (is_not_mstore8.clone() * 31.expr())],
         );
 
         // Stack operations
         // Pop the address from the stack
-        cb.stack_pop(address.expr());
+        cb.stack_pop(address.to_word());
         // For MLOAD push the value to the stack
         // FOR MSTORE pop the value from the stack
         cb.stack_lookup(
             is_mload.expr(),
             cb.stack_pointer_offset().expr() - is_mload.expr(),
-            value.expr(),
+            value.to_word(),
         );
 
         cb.condition(is_mstore8.expr(), |cb| {
-            cb.memory_lookup(
-                1.expr(),
-                from_bytes::expr(&address.cells),
-                value.cells[0].expr(),
-                None,
-            );
+            cb.memory_lookup(1.expr(), address.expr(), value.limbs[0].expr(), None);
         });
 
         cb.condition(is_not_mstore8, |cb| {
             for idx in 0..32 {
                 cb.memory_lookup(
                     is_store.clone(),
-                    from_bytes::expr(&address.cells) + idx.expr(),
-                    value.cells[31 - idx].expr(),
+                    address.expr() + idx.expr(),
+                    value.limbs[31 - idx].expr(),
                     None,
                 );
             }
@@ -128,22 +125,12 @@ impl<F: Field> ExecutionGadget<F> for MemoryGadget<F> {
     ) -> Result<(), Error> {
         self.same_context.assign_exec_step(region, offset, step)?;
 
-        let opcode = step.opcode.unwrap();
+        let opcode = step.opcode().unwrap();
 
         // Inputs/Outputs
-        let [address, value] =
-            [step.rw_indices[0], step.rw_indices[1]].map(|idx| block.rws[idx].stack_value());
-        self.address.assign(
-            region,
-            offset,
-            Some(
-                address.to_le_bytes()[..N_BYTES_MEMORY_ADDRESS]
-                    .try_into()
-                    .unwrap(),
-            ),
-        )?;
-        self.value
-            .assign(region, offset, Some(value.to_le_bytes()))?;
+        let [address, value] = [0, 1].map(|index| block.get_rws(step, index).stack_value());
+        self.address.assign_u256(region, offset, address)?;
+        self.value.assign_u256(region, offset, value)?;
 
         // Check if this is an MLOAD
         self.is_mload.assign(
@@ -165,7 +152,7 @@ impl<F: Field> ExecutionGadget<F> for MemoryGadget<F> {
             region,
             offset,
             step.memory_word_size(),
-            [address.as_u64() + if is_mstore8 == F::one() { 1 } else { 32 }],
+            [address.as_u64() + if is_mstore8 == F::ONE { 1 } else { 32 }],
         )?;
 
         Ok(())
@@ -192,7 +179,7 @@ mod test {
         };
 
         let gas_limit =
-            GasCost::TX.as_u64() + OpcodeId::PUSH32.as_u64() + OpcodeId::PUSH32.as_u64() + gas_cost;
+            GasCost::TX + OpcodeId::PUSH32.as_u64() + OpcodeId::PUSH32.as_u64() + gas_cost;
 
         let ctx = TestContext::<2, 1>::new(
             None,
@@ -250,7 +237,7 @@ mod test {
                 + 31;
             let memory_size = memory_address / 32;
 
-            GasCost::FASTEST.as_u64() + 3 * memory_size + memory_size * memory_size / 512
+            GasCost::FASTEST + 3 * memory_size + memory_size * memory_size / 512
         };
 
         for opcode in [OpcodeId::MSTORE, OpcodeId::MLOAD, OpcodeId::MSTORE8] {
@@ -266,23 +253,5 @@ mod test {
                 calc_gas_cost(opcode, memory_address),
             );
         }
-    }
-
-    #[test]
-    fn oog_static_memory_case() {
-        test_ok(
-            OpcodeId::MSTORE,
-            Word::from(0x12FFFF),
-            Word::from_big_endian(&(1..33).collect::<Vec<_>>()),
-            // insufficient gas
-            3000000,
-        );
-        test_ok(
-            OpcodeId::MLOAD,
-            Word::from(0x12FFFF),
-            Word::from_big_endian(&(1..33).collect::<Vec<_>>()),
-            // insufficient gas
-            21000,
-        );
     }
 }

@@ -9,13 +9,19 @@ use crate::{
                 ConstrainBuilderCommon, EVMConstraintBuilder, StepStateTransition,
                 Transition::{Delta, To},
             },
-            memory_gadget::{MemoryAddressGadget, MemoryCopierGasGadget, MemoryExpansionGadget},
+            memory_gadget::{
+                CommonMemoryAddressGadget, MemoryAddressGadget, MemoryCopierGasGadget,
+                MemoryExpansionGadget,
+            },
             not, select, CachedRegion, Cell,
         },
         witness::{Block, Call, ExecStep, Transaction},
     },
     table::CallContextFieldTag,
-    util::Expr,
+    util::{
+        word::{Word, WordExpr},
+        Expr,
+    },
 };
 use bus_mapping::{circuit_input_builder::CopyDataType, evm::OpcodeId};
 use eth_types::{evm_types::GasCost, Field, ToScalar};
@@ -48,24 +54,27 @@ impl<F: Field> ExecutionGadget<F> for CallDataCopyGadget<F> {
         let call_data_length = cb.query_cell();
         let call_data_offset = cb.query_cell();
 
-        let length = cb.query_word_rlc();
-        let memory_offset = cb.query_cell_phase2();
+        let length = cb.query_memory_address();
+        let memory_offset = cb.query_word_unchecked();
         let data_offset = WordByteCapGadget::construct(cb, call_data_length.expr());
 
         // Pop memory_offset, data_offset, length from stack
-        cb.stack_pop(memory_offset.expr());
-        cb.stack_pop(data_offset.original_word());
-        cb.stack_pop(length.expr());
+        cb.stack_pop(memory_offset.to_word());
+        cb.stack_pop(data_offset.original_word().to_word());
+        cb.stack_pop(length.to_word());
 
         // Lookup the calldata_length and caller_address in Tx context table or
         // Call context table
         cb.condition(cb.curr.state.is_root.expr(), |cb| {
-            cb.call_context_lookup(false.expr(), None, CallContextFieldTag::TxId, src_id.expr());
-            cb.call_context_lookup(
-                false.expr(),
+            cb.call_context_lookup_read(
+                None,
+                CallContextFieldTag::TxId,
+                Word::from_lo_unchecked(src_id.expr()),
+            );
+            cb.call_context_lookup_read(
                 None,
                 CallContextFieldTag::CallDataLength,
-                call_data_length.expr(),
+                Word::from_lo_unchecked(call_data_length.expr()),
             );
             cb.require_zero(
                 "call_data_offset == 0 in the root call",
@@ -73,23 +82,20 @@ impl<F: Field> ExecutionGadget<F> for CallDataCopyGadget<F> {
             );
         });
         cb.condition(1.expr() - cb.curr.state.is_root.expr(), |cb| {
-            cb.call_context_lookup(
-                false.expr(),
+            cb.call_context_lookup_read(
                 None,
                 CallContextFieldTag::CallerId,
-                src_id.expr(),
+                Word::from_lo_unchecked(src_id.expr()),
             );
-            cb.call_context_lookup(
-                false.expr(),
+            cb.call_context_lookup_read(
                 None,
                 CallContextFieldTag::CallDataLength,
-                call_data_length.expr(),
+                Word::from_lo_unchecked(call_data_length.expr()),
             );
-            cb.call_context_lookup(
-                false.expr(),
+            cb.call_context_lookup_read(
                 None,
                 CallContextFieldTag::CallDataOffset,
-                call_data_offset.expr(),
+                Word::from_lo_unchecked(call_data_offset.expr()),
             );
         });
 
@@ -121,9 +127,9 @@ impl<F: Field> ExecutionGadget<F> for CallDataCopyGadget<F> {
             let src_addr_end = call_data_offset.expr() + call_data_length.expr();
 
             cb.copy_table_lookup(
-                src_id.expr(),
+                Word::from_lo_unchecked(src_id.expr()),
                 src_tag,
-                cb.curr.state.call_id.expr(),
+                Word::from_lo_unchecked(cb.curr.state.call_id.expr()),
                 CopyDataType::Memory.expr(),
                 src_addr,
                 src_addr_end,
@@ -179,21 +185,28 @@ impl<F: Field> ExecutionGadget<F> for CallDataCopyGadget<F> {
         self.same_context.assign_exec_step(region, offset, step)?;
 
         let [memory_offset, data_offset, length] =
-            [step.rw_indices[0], step.rw_indices[1], step.rw_indices[2]]
-                .map(|idx| block.rws[idx].stack_value());
+            [0, 1, 2].map(|index| block.get_rws(step, index).stack_value());
         let memory_address = self
             .memory_address
             .assign(region, offset, memory_offset, length)?;
-        let src_id = if call.is_root { tx.id } else { call.caller_id };
-        self.src_id.assign(
-            region,
-            offset,
-            Value::known(F::from(u64::try_from(src_id).unwrap())),
-        )?;
+        let src_id = if call.is_root {
+            tx.id
+        } else {
+            call.caller_id as u64
+        };
+        self.src_id
+            .assign(region, offset, Value::known(F::from(src_id)))?;
 
         // Call data length and call data offset
         let (call_data_length, call_data_offset) = if call.is_root {
-            (tx.call_data_length as u64, 0_u64)
+            (
+                if tx.is_create() {
+                    0
+                } else {
+                    tx.call_data.len() as u64
+                },
+                0_u64,
+            )
         } else {
             (call.call_data_length, call.call_data_offset)
         };
@@ -254,7 +267,7 @@ impl<F: Field> ExecutionGadget<F> for CallDataCopyGadget<F> {
 #[cfg(test)]
 mod test {
     use crate::{evm_circuit::test::rand_bytes, test_util::CircuitTestBuilder};
-    use bus_mapping::circuit_input_builder::CircuitsParams;
+    use bus_mapping::circuit_input_builder::FixedCParams;
     use eth_types::{bytecode, Word};
     use mock::{
         generate_mock_call_bytecode,
@@ -264,9 +277,9 @@ mod test {
 
     fn test_root_ok(
         call_data_length: usize,
-        memory_offset: usize,
         length: usize,
         data_offset: Word,
+        memory_offset: Word,
     ) {
         let bytecode = bytecode! {
             PUSH32(length)
@@ -293,9 +306,9 @@ mod test {
         .unwrap();
 
         CircuitTestBuilder::new_from_test_ctx(ctx)
-            .params(CircuitsParams {
+            .params(FixedCParams {
                 max_calldata: 600,
-                ..CircuitsParams::default()
+                ..FixedCParams::default()
             })
             .run();
     }
@@ -303,9 +316,9 @@ mod test {
     fn test_internal_ok(
         call_data_offset: usize,
         call_data_length: usize,
-        dst_offset: usize,
         length: usize,
         data_offset: Word,
+        dst_offset: Word,
     ) {
         let (addr_a, addr_b) = (mock::MOCK_ACCOUNTS[0], mock::MOCK_ACCOUNTS[1]);
 
@@ -344,31 +357,37 @@ mod test {
 
     #[test]
     fn calldatacopy_gadget_simple() {
-        test_root_ok(0x40, 0x40, 10, 0x00.into());
-        test_internal_ok(0x40, 0x40, 0xA0, 10, 0x10.into());
+        test_root_ok(0x40, 10, 0x00.into(), 0x40.into());
+        test_internal_ok(0x40, 0x40, 10, 0x10.into(), 0xA0.into());
     }
 
     #[test]
     fn calldatacopy_gadget_large() {
-        test_root_ok(0x204, 0x103, 0x101, 0x102.into());
-        test_internal_ok(0x30, 0x204, 0x103, 0x101, 0x102.into());
+        test_root_ok(0x204, 0x101, 0x102.into(), 0x103.into());
+        test_internal_ok(0x30, 0x204, 0x101, 0x102.into(), 0x103.into());
     }
 
     #[test]
     fn calldatacopy_gadget_out_of_bound() {
-        test_root_ok(0x40, 0x40, 40, 0x20.into());
-        test_internal_ok(0x40, 0x20, 0xA0, 10, 0x28.into());
+        test_root_ok(0x40, 40, 0x20.into(), 0x40.into());
+        test_internal_ok(0x40, 0x20, 10, 0x28.into(), 0xA0.into());
     }
 
     #[test]
     fn calldatacopy_gadget_zero_length() {
-        test_root_ok(0x40, 0x40, 0, 0x00.into());
-        test_internal_ok(0x40, 0x40, 0xA0, 0, 0x10.into());
+        test_root_ok(0x40, 0, 0x00.into(), 0x40.into());
+        test_internal_ok(0x40, 0x40, 0, 0x10.into(), 0xA0.into());
     }
 
     #[test]
     fn calldatacopy_gadget_data_offset_overflow() {
-        test_root_ok(0x40, 0x40, 0, Word::MAX);
-        test_internal_ok(0x40, 0x40, 0xA0, 0, Word::MAX);
+        test_root_ok(0x40, 10, Word::MAX, 0x40.into());
+        test_internal_ok(0x40, 0x40, 10, Word::MAX, 0xA0.into());
+    }
+
+    #[test]
+    fn calldatacopy_gadget_overflow_memory_offset_and_zero_length() {
+        test_root_ok(0x40, 0, 0x40.into(), Word::MAX);
+        test_internal_ok(0x40, 0x40, 0, 0x10.into(), Word::MAX);
     }
 }

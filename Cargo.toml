@@ -3,19 +3,20 @@ members = [
     "zkevm-circuits",
     "bus-mapping",
     "geth-utils",
-    "keccak256",
     "gadgets",
     "integration-tests",
     "circuit-benchmarks",
     "eth-types",
     "external-tracer",
     "mock",
-    "testool"
+    "testool",
+    "mpt-witness-generator/rustlib",
+    "light-client-poc"
 ]
 
 [patch.crates-io]
-# halo2_proofs = { git = "https://github.com/tuzijun111/halo2_PSE"} 
-halo2_proofs = { git = "https://github.com/tuzijun111/halo2_PSE" } 
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.git", tag = "v2023_04_20" }
+
 # Definition of benchmarks profile to use.
 [profile.bench]
 opt-level = 3

@@ -68,25 +68,25 @@ fn gen_log_step(
         call_id,
         CallContextField::TxId,
         state.tx_ctx.id().into(),
-    );
+    )?;
     state.call_context_read(
         &mut exec_step,
         call_id,
         CallContextField::IsStatic,
         Word::from(state.call()?.is_static as u8),
-    );
+    )?;
     state.call_context_read(
         &mut exec_step,
         call_id,
         CallContextField::CalleeAddress,
         state.call()?.address.to_word(),
-    );
+    )?;
     state.call_context_read(
         &mut exec_step,
         call_id,
         CallContextField::IsPersistent,
         Word::from(state.call()?.is_persistent as u8),
-    );
+    )?;
 
     if state.call()?.is_persistent {
         state.tx_log_write(
@@ -285,13 +285,13 @@ mod log_tests {
         .unwrap()
         .into();
 
-        let mut builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
-        builder
+        let builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
+        let builder = builder
             .handle_block(&block.eth_block, &block.geth_traces)
             .unwrap();
 
         let is_persistent = builder.block.txs()[0].calls()[0].is_persistent;
-        let callee_address = builder.block.txs()[0].tx.to_or_contract_addr();
+        let callee_address = builder.block.txs()[0].to_or_contract_addr();
 
         let step = builder.block.txs()[0]
             .steps()

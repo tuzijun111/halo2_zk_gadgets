@@ -25,7 +25,7 @@ impl Opcode for Selfbalance {
             state.call()?.call_id,
             CallContextField::CalleeAddress,
             callee_address.to_word(),
-        );
+        )?;
 
         // Account read for the balance of the callee_address
         state.account_read(
@@ -33,7 +33,7 @@ impl Opcode for Selfbalance {
             callee_address,
             AccountField::Balance,
             self_balance,
-        );
+        )?;
 
         // Stack write of self_balance
         state.stack_write(
@@ -79,8 +79,8 @@ mod selfbalance_tests {
         .unwrap()
         .into();
 
-        let mut builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
-        builder
+        let builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
+        let builder = builder
             .handle_block(&block.eth_block, &block.geth_traces)
             .unwrap();
 
@@ -91,7 +91,7 @@ mod selfbalance_tests {
             .unwrap();
 
         let call_id = builder.block.txs()[0].calls()[0].call_id;
-        let callee_address = builder.block.txs()[0].tx.to_or_contract_addr();
+        let callee_address = builder.block.txs()[0].to_or_contract_addr();
         let self_balance = builder.sdb.get_account(&callee_address).1.balance;
 
         assert_eq!(

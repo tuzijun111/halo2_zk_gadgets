@@ -1,5 +1,5 @@
 use bus_mapping::{circuit_input_builder::CopyDataType, evm::OpcodeId};
-use eth_types::{evm_types::GasCost, Field, ToScalar, ToWord};
+use eth_types::{evm_types::GasCost, Field, ToScalar};
 use halo2_proofs::{circuit::Value, plonk::Error};
 
 use crate::{
@@ -11,12 +11,18 @@ use crate::{
             constraint_builder::{
                 ConstrainBuilderCommon, EVMConstraintBuilder, StepStateTransition, Transition,
             },
-            memory_gadget::{MemoryAddressGadget, MemoryCopierGasGadget, MemoryExpansionGadget},
+            memory_gadget::{
+                CommonMemoryAddressGadget, MemoryAddressGadget, MemoryCopierGasGadget,
+                MemoryExpansionGadget,
+            },
             not, select, CachedRegion, Cell,
         },
         witness::{Block, Call, ExecStep, Transaction},
     },
-    util::Expr,
+    util::{
+        word::{Word, WordExpr},
+        Expr,
+    },
 };
 
 use super::ExecutionGadget;
@@ -53,23 +59,23 @@ impl<F: Field> ExecutionGadget<F> for CodeCopyGadget<F> {
 
         let code_size = cb.query_cell();
 
-        let size = cb.query_word_rlc();
-        let dst_memory_offset = cb.query_cell_phase2();
+        let length = cb.query_memory_address();
+        let dst_memory_offset = cb.query_word_unchecked();
         let code_offset = WordByteCapGadget::construct(cb, code_size.expr());
 
         // Pop items from stack.
-        cb.stack_pop(dst_memory_offset.expr());
-        cb.stack_pop(code_offset.original_word());
-        cb.stack_pop(size.expr());
+        cb.stack_pop(dst_memory_offset.to_word());
+        cb.stack_pop(code_offset.original_word().to_word());
+        cb.stack_pop(Word::from_lo_unchecked(length.expr()));
 
         // Construct memory address in the destionation (memory) to which we copy code.
-        let dst_memory_addr = MemoryAddressGadget::construct(cb, dst_memory_offset, size);
+        let dst_memory_addr = MemoryAddressGadget::construct(cb, dst_memory_offset, length);
 
         // Fetch the hash of bytecode running in current environment.
         let code_hash = cb.curr.state.code_hash.clone();
 
         // Fetch the bytecode length from the bytecode table.
-        cb.bytecode_length(code_hash.expr(), code_size.expr());
+        cb.bytecode_length(code_hash.to_word(), code_size.expr());
 
         // Calculate the next memory size and the gas cost for this memory
         // access. This also accounts for the dynamic gas required to copy bytes to
@@ -91,9 +97,9 @@ impl<F: Field> ExecutionGadget<F> for CodeCopyGadget<F> {
             );
 
             cb.copy_table_lookup(
-                code_hash.expr(),
+                code_hash.to_word(),
                 CopyDataType::Bytecode.expr(),
-                cb.curr.state.call_id.expr(),
+                Word::from_lo_unchecked(cb.curr.state.call_id.expr()),
                 CopyDataType::Memory.expr(),
                 src_addr,
                 code_size.expr(),
@@ -152,14 +158,14 @@ impl<F: Field> ExecutionGadget<F> for CodeCopyGadget<F> {
         // 3. `size` is the number of
         // bytes to be read and written (0s to be copied for out of bounds).
         let [dest_offset, code_offset, size] =
-            [0, 1, 2].map(|i| block.rws[step.rw_indices[i]].stack_value());
+            [0, 1, 2].map(|index| block.get_rws(step, index).stack_value());
 
         let bytecode = block
             .bytecodes
-            .get(&call.code_hash.to_word())
+            .get_from_h256(&call.code_hash)
             .expect("could not find current environment's bytecode");
 
-        let code_size = bytecode.bytes.len() as u64;
+        let code_size = bytecode.codesize() as u64;
         self.code_size
             .assign(region, offset, Value::known(F::from(code_size)))?;
 
@@ -200,7 +206,7 @@ mod tests {
     use eth_types::{bytecode, Word};
     use mock::TestContext;
 
-    fn test_ok(code_offset: Word, memory_offset: usize, size: usize, large: bool) {
+    fn test_ok(code_offset: Word, memory_offset: Word, size: usize, large: bool) {
         let mut code = bytecode! {};
         if large {
             for _ in 0..size {
@@ -210,7 +216,7 @@ mod tests {
         let tail = bytecode! {
             PUSH32(Word::from(size))
             PUSH32(code_offset)
-            PUSH32(Word::from(memory_offset))
+            PUSH32(memory_offset)
             CODECOPY
             STOP
         };
@@ -224,18 +230,23 @@ mod tests {
 
     #[test]
     fn codecopy_gadget_simple() {
-        test_ok(0x00.into(), 0x00, 0x20, false);
-        test_ok(0x30.into(), 0x20, 0x30, false);
-        test_ok(0x20.into(), 0x10, 0x42, false);
+        test_ok(0x00.into(), 0x00.into(), 0x20, false);
+        test_ok(0x30.into(), 0x20.into(), 0x30, false);
+        test_ok(0x20.into(), 0x10.into(), 0x42, false);
     }
 
     #[test]
     fn codecopy_gadget_large() {
-        test_ok(0x102.into(), 0x103, 0x101, true);
+        test_ok(0x102.into(), 0x103.into(), 0x101, true);
     }
 
     #[test]
     fn codecopy_gadget_code_offset_overflow() {
-        test_ok(Word::MAX, 0x103, 0x101, true);
+        test_ok(Word::MAX, 0x103.into(), 0x101, true);
+    }
+
+    #[test]
+    fn codecopy_gadget_overflow_memory_offset_and_zero_size() {
+        test_ok(0x102.into(), Word::MAX, 0, false);
     }
 }

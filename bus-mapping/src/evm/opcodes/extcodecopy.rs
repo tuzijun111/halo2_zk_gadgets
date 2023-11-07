@@ -11,9 +11,6 @@ use eth_types::{Bytecode, GethExecStep, ToAddress, ToWord, H256, U256};
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Extcodecopy;
 
-// TODO: Update to treat code_hash == 0 as account not_exists once the circuit
-// is implemented https://github.com/privacy-scaling-explorations/zkevm-circuits/pull/720
-
 impl Opcode for Extcodecopy {
     fn gen_associated_ops(
         state: &mut CircuitInputStateRef,
@@ -37,7 +34,7 @@ impl Opcode for Extcodecopy {
 
         memory.copy_from(dst_offset, code_offset, length, &code);
 
-        let copy_event = gen_copy_event(state, geth_step)?;
+        let copy_event = gen_copy_event(state, geth_step, &mut exec_steps[0])?;
         state.push_copy(&mut exec_steps[0], copy_event);
         Ok(exec_steps)
     }
@@ -80,7 +77,7 @@ fn gen_extcodecopy_step(
             U256::from(state.call()?.is_persistent as u64),
         ),
     ] {
-        state.call_context_read(&mut exec_step, state.call()?.call_id, field, value);
+        state.call_context_read(&mut exec_step, state.call()?.call_id, field, value)?;
     }
 
     let is_warm = state.sdb.check_account_in_access_list(&external_address);
@@ -107,13 +104,14 @@ fn gen_extcodecopy_step(
         external_address,
         AccountField::CodeHash,
         code_hash.to_word(),
-    );
+    )?;
     Ok(exec_step)
 }
 
 fn gen_copy_event(
     state: &mut CircuitInputStateRef,
     geth_step: &GethExecStep,
+    exec_step: &mut ExecStep,
 ) -> Result<CopyEvent, Error> {
     let rw_counter_start = state.block_ctx.rwc;
 
@@ -135,9 +133,11 @@ fn gen_copy_event(
     } else {
         Bytecode::default()
     };
-    let code_size = bytecode.code.len() as u64;
+    let code_size = bytecode.codesize() as u64;
 
-    let dst_addr = dst_offset.as_u64();
+    // Get low Uint64 of offset to generate copy steps. Since offset could be
+    // Uint64 overflow if length is zero.
+    let dst_addr = dst_offset.low_u64();
     let src_addr_end = code_size;
 
     // Reset start offset to end offset if overflow.
@@ -145,9 +145,8 @@ fn gen_copy_event(
         .unwrap_or(src_addr_end)
         .min(src_addr_end);
 
-    let mut exec_step = state.new_step(geth_step)?;
     let copy_steps = state.gen_copy_steps_for_bytecode(
-        &mut exec_step,
+        exec_step,
         &bytecode,
         src_addr,
         dst_addr,
@@ -242,8 +241,8 @@ mod extcodecopy_tests {
         .unwrap()
         .into();
 
-        let mut builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
-        builder
+        let builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
+        let mut builder = builder
             .handle_block(&block.eth_block, &block.geth_traces)
             .unwrap();
 
@@ -411,11 +410,7 @@ mod extcodecopy_tests {
                         MemoryOp::new(
                             expected_call_id,
                             MemoryAddress::from(memory_offset + idx),
-                            if data_offset + idx < bytecode_ext.to_vec().len() {
-                                bytecode_ext.to_vec()[data_offset + idx]
-                            } else {
-                                0
-                            },
+                            bytecode_ext.get_byte(data_offset + idx).unwrap_or(0),
                         ),
                     )
                 })
@@ -437,10 +432,9 @@ mod extcodecopy_tests {
         assert_eq!(copy_events[0].dst_type, CopyDataType::Memory);
         assert!(copy_events[0].log_id.is_none());
 
-        for (idx, (value, is_code)) in copy_events[0].bytes.iter().enumerate() {
+        for (idx, &(value, is_code)) in copy_events[0].bytes.iter().enumerate() {
             let bytecode_element = bytecode_ext.get(idx).unwrap_or_default();
-            assert_eq!(*value, bytecode_element.value);
-            assert_eq!(*is_code, bytecode_element.is_code);
+            assert_eq!((value, is_code), bytecode_element);
         }
     }
 

@@ -1,7 +1,6 @@
-#![allow(unused_imports)]
 pub use super::{dev::*, *};
 use crate::{
-    table::{AccountFieldTag, CallContextFieldTag, RwTableTag, TxLogFieldTag, TxReceiptFieldTag},
+    table::{AccountFieldTag, CallContextFieldTag, TxLogFieldTag, TxReceiptFieldTag},
     util::{unusable_rows, SubCircuit},
     witness::{MptUpdates, Rw, RwMap},
 };
@@ -11,15 +10,14 @@ use bus_mapping::operation::{
 use eth_types::{
     address,
     evm_types::{MemoryAddress, StackAddress},
-    Address, Field, ToAddress, Word, U256,
+    Address, ToAddress, Word, U256,
 };
 use gadgets::binary_number::AsBits;
 use halo2_proofs::{
     arithmetic::Field as Halo2Field,
-    circuit::SimpleFloorPlanner,
     dev::{MockProver, VerifyFailure},
     halo2curves::bn256::{Bn256, Fr},
-    plonk::{keygen_vk, Advice, Circuit, Column, ConstraintSystem},
+    plonk::{keygen_vk, Circuit, ConstraintSystem},
     poly::kzg::commitment::ParamsKZG,
 };
 use rand::SeedableRng;
@@ -32,7 +30,7 @@ const N_ROWS: usize = 1 << 16;
 fn state_circuit_unusable_rows() {
     assert_eq!(
         StateCircuit::<Fr>::unusable_rows(),
-        unusable_rows::<Fr, StateCircuit::<Fr>>(),
+        unusable_rows::<Fr, StateCircuit::<Fr>>(()),
     )
 }
 
@@ -60,7 +58,7 @@ fn test_state_circuit_ok(
 fn degree() {
     let mut meta = ConstraintSystem::<Fr>::default();
     StateCircuit::<Fr>::configure(&mut meta);
-    assert_eq!(meta.degree(), 9);
+    assert_eq!(meta.degree(), 10);
 }
 
 #[test]
@@ -282,21 +280,6 @@ fn diff_1_problem_repro() {
 }
 
 #[test]
-fn storage_key_rlc() {
-    let rows = vec![Rw::AccountStorage {
-        rw_counter: 1,
-        is_write: false,
-        account_address: Address::default(),
-        storage_key: U256::from(256),
-        value: U256::from(300),
-        value_prev: U256::from(300),
-        tx_id: 4,
-        committed_value: U256::from(300),
-    }];
-    assert_eq!(verify(rows), Ok(()));
-}
-
-#[test]
 fn tx_log_ok() {
     let rows = vec![
         Rw::Stack {
@@ -382,7 +365,7 @@ fn address_limb_mismatch() {
         value: U256::zero(),
         value_prev: U256::zero(),
     }];
-    let overrides = HashMap::from([((AdviceColumn::AddressLimb0, 0), Fr::zero())]);
+    let overrides = HashMap::from([((AdviceColumn::AddressLimb0, 0), Fr::ZERO)]);
 
     let result = verify_with_overrides(rows, overrides);
 
@@ -401,7 +384,7 @@ fn address_limb_out_of_range() {
     }];
     let overrides = HashMap::from([
         ((AdviceColumn::AddressLimb0, 0), Fr::from(1 << 16)),
-        ((AdviceColumn::AddressLimb1, 0), Fr::zero()),
+        ((AdviceColumn::AddressLimb1, 0), Fr::ZERO),
     ]);
 
     let result = verify_with_overrides(rows, overrides);
@@ -421,38 +404,11 @@ fn storage_key_mismatch() {
         tx_id: 4,
         committed_value: U256::from(34),
     }];
-    let overrides = HashMap::from([((AdviceColumn::StorageKeyByte1, 0), Fr::one())]);
+    let overrides = HashMap::from([((AdviceColumn::StorageKeyLimb0, 0), Fr::ONE)]);
 
     let result = verify_with_overrides(rows, overrides);
 
-    assert_error_matches(result, "rlc encoded value matches bytes");
-}
-
-#[test]
-fn storage_key_byte_out_of_range() {
-    let rows = vec![Rw::AccountStorage {
-        rw_counter: 1,
-        is_write: false,
-        account_address: Address::default(),
-        storage_key: U256::from(256),
-        value: U256::from(500),
-        value_prev: U256::from(500),
-        tx_id: 4,
-        committed_value: U256::from(500),
-    }];
-    let overrides = HashMap::from([
-        ((AdviceColumn::StorageKeyByte0, 0), Fr::from(0xcafeu64)),
-        ((AdviceColumn::StorageKeyByte1, 0), Fr::zero()),
-    ]);
-
-    // This will trigger two errors: an RLC encoding error and the "fit into u8", we
-    // remove the first one
-    let result = verify_with_overrides(rows, overrides).map_err(|mut err| {
-        err.remove(0);
-        err
-    });
-
-    assert_error_matches(result, "rlc bytes fit into u8");
+    assert_error_matches(result, "mpi value matches claimed limbs");
 }
 
 #[test]
@@ -656,8 +612,8 @@ fn lexicographic_ordering_previous_limb_differences_nonzero() {
     // limb difference between the two rows here is still 1, so no additional
     // overrides are needed.
     let overrides = HashMap::from([
-        ((AdviceColumn::LimbIndexBit1, 1), Fr::one()),
-        ((AdviceColumn::LimbIndexBit2, 1), Fr::one()),
+        ((AdviceColumn::LimbIndexBit1, 1), Fr::ONE),
+        ((AdviceColumn::LimbIndexBit2, 1), Fr::ONE),
     ]);
 
     let result = verify_with_overrides(rows, overrides);
@@ -706,7 +662,7 @@ fn skipped_start_rw_counter() {
             // The original assignment is 1 << 16.
             Fr::from((1 << 16) + 1),
         ),
-        ((AdviceColumn::RwCounterLimb0, -1), Fr::one()),
+        ((AdviceColumn::RwCounterLimb0, -1), Fr::ONE),
     ]);
 
     let result = prover(vec![], overrides).verify_at_rows(N_ROWS - 1..N_ROWS, N_ROWS - 1..N_ROWS);
@@ -738,11 +694,14 @@ fn bad_initial_memory_value() {
 
     let v = Fr::from(200);
     let overrides = HashMap::from([
-        ((AdviceColumn::Value, 0), v),
-        ((AdviceColumn::ValuePrev, 0), v),
-        ((AdviceColumn::IsZero, 0), Fr::zero()),
+        ((AdviceColumn::ValueLo, 0), v),
+        ((AdviceColumn::ValueHi, 0), Fr::ZERO),
+        ((AdviceColumn::ValuePrevLo, 0), v),
+        ((AdviceColumn::ValuePrevHi, 0), Fr::ZERO),
+        ((AdviceColumn::IsZero, 0), Fr::ZERO),
         ((AdviceColumn::NonEmptyWitness, 0), v.invert().unwrap()),
-        ((AdviceColumn::InitialValue, 0), v),
+        ((AdviceColumn::InitialValueLo, 0), v),
+        ((AdviceColumn::InitialValueHi, 0), Fr::ZERO),
     ]);
 
     let result = verify_with_overrides(rows, overrides);
@@ -761,13 +720,14 @@ fn invalid_memory_value() {
     }];
     let v = Fr::from(256);
     let overrides = HashMap::from([
-        ((AdviceColumn::Value, 0), v),
+        ((AdviceColumn::ValueHi, 0), Fr::ZERO),
+        ((AdviceColumn::ValueLo, 0), v),
         ((AdviceColumn::NonEmptyWitness, 0), v.invert().unwrap()),
     ]);
 
     let result = verify_with_overrides(rows, overrides);
 
-    assert_error_matches(result, "memory value is a byte");
+    assert_error_matches(result, "memory value is a byte (lo is u8)");
 }
 
 #[test]
@@ -824,14 +784,12 @@ fn invalid_stack_address_change() {
 #[test]
 fn invalid_tags() {
     let first_row_offset = -isize::try_from(N_ROWS).unwrap();
-    let tags: BTreeSet<usize> = RwTableTag::iter().map(|x| x as usize).collect();
+    let tags: BTreeSet<usize> = Target::iter().map(|x| x as usize).collect();
     for i in 0..16 {
         if tags.contains(&i) {
             continue;
         }
-        let bits: [Fr; 4] = i
-            .as_bits()
-            .map(|bit| if bit { Fr::one() } else { Fr::zero() });
+        let bits: [Fr; 4] = i.as_bits().map(|bit| if bit { Fr::ONE } else { Fr::ZERO });
         let overrides = HashMap::from([
             ((AdviceColumn::TagBit0, first_row_offset), bits[0]),
             ((AdviceColumn::TagBit1, first_row_offset), bits[1]),
@@ -857,8 +815,10 @@ fn bad_initial_stack_value() {
     }];
 
     let overrides = HashMap::from([
-        ((AdviceColumn::InitialValue, 0), Fr::from(10)),
-        ((AdviceColumn::ValuePrev, 0), Fr::from(10)),
+        ((AdviceColumn::InitialValueHi, 0), Fr::ZERO),
+        ((AdviceColumn::InitialValueLo, 0), Fr::from(10)),
+        ((AdviceColumn::ValuePrevHi, 0), Fr::ZERO),
+        ((AdviceColumn::ValuePrevLo, 0), Fr::from(10)),
     ]);
 
     assert_error_matches(
@@ -879,8 +839,10 @@ fn bad_initial_tx_access_list_account_value() {
     }];
 
     let overrides = HashMap::from([
-        ((AdviceColumn::InitialValue, 0), Fr::from(1)),
-        ((AdviceColumn::ValuePrev, 0), Fr::from(1)),
+        ((AdviceColumn::InitialValueHi, 0), Fr::ZERO),
+        ((AdviceColumn::InitialValueLo, 0), Fr::from(1)),
+        ((AdviceColumn::ValuePrevHi, 0), Fr::ZERO),
+        ((AdviceColumn::ValuePrevLo, 0), Fr::from(1)),
     ]);
 
     assert_error_matches(
@@ -901,11 +863,14 @@ fn bad_initial_tx_refund_value() {
     let v = Fr::from(10);
     let overrides = HashMap::from([
         ((AdviceColumn::IsWrite, 0), Fr::from(1)),
-        ((AdviceColumn::Value, 0), v),
-        ((AdviceColumn::ValuePrev, 0), v),
-        ((AdviceColumn::IsZero, 0), Fr::zero()),
+        ((AdviceColumn::ValueHi, 0), Fr::ZERO),
+        ((AdviceColumn::ValueLo, 0), v),
+        ((AdviceColumn::ValuePrevHi, 0), Fr::ZERO),
+        ((AdviceColumn::ValuePrevLo, 0), v),
+        ((AdviceColumn::IsZero, 0), Fr::ZERO),
         ((AdviceColumn::NonEmptyWitness, 0), v.invert().unwrap()),
-        ((AdviceColumn::InitialValue, 0), v),
+        ((AdviceColumn::InitialValueHi, 0), Fr::ZERO),
+        ((AdviceColumn::InitialValueLo, 0), v),
     ]);
 
     assert_error_matches(
@@ -927,8 +892,10 @@ fn bad_initial_tx_log_value() {
     }];
 
     let overrides = HashMap::from([
-        ((AdviceColumn::InitialValue, 0), Fr::from(10)),
-        ((AdviceColumn::ValuePrev, 0), Fr::from(10)),
+        ((AdviceColumn::InitialValueHi, 0), Fr::ZERO),
+        ((AdviceColumn::InitialValueLo, 0), Fr::from(10)),
+        ((AdviceColumn::ValuePrevHi, 0), Fr::ZERO),
+        ((AdviceColumn::ValuePrevLo, 0), Fr::from(10)),
     ]);
 
     assert_error_matches(
@@ -1011,8 +978,10 @@ fn bad_initial_tx_receipt_value() {
     }];
 
     let overrides = HashMap::from([
-        ((AdviceColumn::Value, 0), Fr::from(1900)),
-        ((AdviceColumn::InitialValue, 0), Fr::from(1900)),
+        ((AdviceColumn::ValueHi, 0), Fr::ZERO),
+        ((AdviceColumn::ValueLo, 0), Fr::from(1900)),
+        ((AdviceColumn::InitialValueHi, 0), Fr::ZERO),
+        ((AdviceColumn::InitialValueLo, 0), Fr::from(1900)),
     ]);
 
     assert_error_matches(

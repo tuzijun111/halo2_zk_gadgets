@@ -32,7 +32,7 @@ impl Opcode for Codecopy {
 
         memory.copy_from(dst_offset, code_offset, length, &code);
 
-        let copy_event = gen_copy_event(state, geth_step)?;
+        let copy_event = gen_copy_event(state, geth_step, &mut exec_steps[0])?;
         state.push_copy(&mut exec_steps[0], copy_event);
         Ok(exec_steps)
     }
@@ -67,6 +67,7 @@ fn gen_codecopy_step(
 fn gen_copy_event(
     state: &mut CircuitInputStateRef,
     geth_step: &GethExecStep,
+    exec_step: &mut ExecStep,
 ) -> Result<CopyEvent, Error> {
     let rw_counter_start = state.block_ctx.rwc;
 
@@ -76,9 +77,11 @@ fn gen_copy_event(
 
     let code_hash = state.call()?.code_hash;
     let bytecode: Bytecode = state.code(code_hash)?.into();
-    let code_size = bytecode.code.len() as u64;
+    let code_size = bytecode.codesize() as u64;
 
-    let dst_addr = dst_offset.as_u64();
+    // Get low Uint64 of offset to generate copy steps. Since offset could be
+    // Uint64 overflow if length is zero.
+    let dst_addr = dst_offset.low_u64();
     let src_addr_end = code_size;
 
     // Reset start offset to end offset if overflow.
@@ -86,9 +89,8 @@ fn gen_copy_event(
         .unwrap_or(src_addr_end)
         .min(src_addr_end);
 
-    let mut exec_step = state.new_step(geth_step)?;
     let copy_steps = state.gen_copy_steps_for_bytecode(
-        &mut exec_step,
+        exec_step,
         &bytecode,
         src_addr,
         dst_addr,
@@ -127,7 +129,6 @@ mod codecopy_tests {
         circuit_input_builder::{CopyDataType, ExecState, NumberOrHash},
         mock::BlockData,
         operation::{MemoryOp, StackOp, RW},
-        state_db::CodeDB,
     };
 
     #[test]
@@ -154,8 +155,8 @@ mod codecopy_tests {
         .unwrap()
         .into();
 
-        let mut builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
-        builder
+        let builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
+        let builder = builder
             .handle_block(&block.eth_block, &block.geth_traces)
             .unwrap();
 
@@ -200,11 +201,7 @@ mod codecopy_tests {
                         MemoryOp::new(
                             1,
                             MemoryAddress::from(dst_offset + idx),
-                            if code_offset + idx < code.to_vec().len() {
-                                code.to_vec()[code_offset + idx]
-                            } else {
-                                0
-                            },
+                            code.get_byte(code_offset + idx).unwrap_or(0),
                         ),
                     )
                 })
@@ -214,12 +211,9 @@ mod codecopy_tests {
         let copy_events = builder.block.copy_events.clone();
         assert_eq!(copy_events.len(), 1);
         assert_eq!(copy_events[0].bytes.len(), size);
-        assert_eq!(
-            copy_events[0].src_id,
-            NumberOrHash::Hash(CodeDB::hash(&code.to_vec()))
-        );
+        assert_eq!(copy_events[0].src_id, NumberOrHash::Hash(code.hash_h256()));
         assert_eq!(copy_events[0].src_addr as usize, code_offset);
-        assert_eq!(copy_events[0].src_addr_end as usize, code.to_vec().len());
+        assert_eq!(copy_events[0].src_addr_end as usize, code.codesize());
         assert_eq!(copy_events[0].src_type, CopyDataType::Bytecode);
         assert_eq!(
             copy_events[0].dst_id,
@@ -229,10 +223,10 @@ mod codecopy_tests {
         assert_eq!(copy_events[0].dst_type, CopyDataType::Memory);
         assert!(copy_events[0].log_id.is_none());
 
-        for (idx, (value, is_code)) in copy_events[0].bytes.iter().enumerate() {
-            let bytecode_element = code.get(code_offset + idx).unwrap_or_default();
-            assert_eq!(*value, bytecode_element.value);
-            assert_eq!(*is_code, bytecode_element.is_code);
+        for (idx, &(value, is_code)) in copy_events[0].bytes.iter().enumerate() {
+            let (true_value, true_is_code) = code.get(code_offset + idx).unwrap_or_default();
+            assert_eq!(value, true_value);
+            assert_eq!(is_code, true_is_code);
         }
     }
 }

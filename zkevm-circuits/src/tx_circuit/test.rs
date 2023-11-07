@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 use super::*;
 use crate::util::{log2_ceil, unusable_rows};
 use eth_types::address;
@@ -12,7 +11,7 @@ use mock::AddrOrWallet;
 fn tx_circuit_unusable_rows() {
     assert_eq!(
         TxCircuit::<Fr>::unusable_rows(),
-        unusable_rows::<Fr, TxCircuit::<Fr>>(),
+        unusable_rows::<Fr, TxCircuit::<Fr>>(()),
     )
 }
 

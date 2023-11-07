@@ -7,15 +7,18 @@ use crate::{
             common_gadget::CommonErrorGadget,
             constraint_builder::{ConstrainBuilderCommon, EVMConstraintBuilder},
             math_gadget::{ByteSizeGadget, LtGadget},
-            CachedRegion, Cell, Word,
+            CachedRegion, Cell,
         },
         witness::{Block, Call, ExecStep, Transaction},
     },
-    util::Expr,
+    util::{
+        word::{Word32Cell, WordExpr},
+        Expr,
+    },
 };
 use eth_types::{
     evm_types::{GasCost, OpcodeId},
-    Field, ToLittleEndian,
+    Field,
 };
 use halo2_proofs::{circuit::Value, plonk::Error};
 
@@ -24,8 +27,8 @@ use halo2_proofs::{circuit::Value, plonk::Error};
 #[derive(Clone, Debug)]
 pub(crate) struct ErrorOOGExpGadget<F> {
     opcode: Cell<F>,
-    base: Word<F>,
-    exponent: Word<F>,
+    base: Word32Cell<F>,
+    exponent: Word32Cell<F>,
     exponent_byte_size: ByteSizeGadget<F>,
     insufficient_gas_cost: LtGadget<F, N_BYTES_GAS>,
     common_error_gadget: CommonErrorGadget<F>,
@@ -45,15 +48,15 @@ impl<F: Field> ExecutionGadget<F> for ErrorOOGExpGadget<F> {
             OpcodeId::EXP.expr(),
         );
 
-        let base = cb.query_word_rlc();
-        let exponent = cb.query_word_rlc();
-        cb.stack_pop(base.expr());
-        cb.stack_pop(exponent.expr());
+        let base = cb.query_word32();
+        let exponent = cb.query_word32();
+        cb.stack_pop(base.to_word());
+        cb.stack_pop(exponent.to_word());
 
         let exponent_byte_size = ByteSizeGadget::construct(
             cb,
             exponent
-                .cells
+                .limbs
                 .iter()
                 .map(Expr::expr)
                 .collect::<Vec<_>>()
@@ -67,7 +70,7 @@ impl<F: Field> ExecutionGadget<F> for ErrorOOGExpGadget<F> {
             // static_gas = 10
             // dynamic_gas = exponent_byte_size * 50
             // gas_cost = dynamic_gas + static_gas
-            exponent_byte_size.byte_size() * GasCost::EXP_BYTE_TIMES.0.expr()
+            exponent_byte_size.byte_size() * GasCost::EXP_BYTE_TIMES.expr()
                 + OpcodeId::EXP.constant_gas_cost().expr(),
         );
 
@@ -77,7 +80,8 @@ impl<F: Field> ExecutionGadget<F> for ErrorOOGExpGadget<F> {
             1.expr(),
         );
 
-        let common_error_gadget = CommonErrorGadget::construct(cb, opcode.expr(), 4.expr());
+        let common_error_gadget =
+            CommonErrorGadget::construct(cb, opcode.expr(), cb.rw_counter_offset());
         Self {
             opcode,
             base,
@@ -97,8 +101,8 @@ impl<F: Field> ExecutionGadget<F> for ErrorOOGExpGadget<F> {
         call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        let opcode = step.opcode.unwrap();
-        let [base, exponent] = [0, 1].map(|idx| block.rws[step.rw_indices[idx]].stack_value());
+        let opcode = step.opcode().unwrap();
+        let [base, exponent] = [0, 1].map(|index| block.get_rws(step, index).stack_value());
 
         log::debug!(
             "ErrorOutOfGasEXP: gas_left = {}, gas_cost = {}",
@@ -108,9 +112,8 @@ impl<F: Field> ExecutionGadget<F> for ErrorOOGExpGadget<F> {
 
         self.opcode
             .assign(region, offset, Value::known(F::from(opcode.as_u64())))?;
-        self.base.assign(region, offset, Some(base.to_le_bytes()))?;
-        self.exponent
-            .assign(region, offset, Some(exponent.to_le_bytes()))?;
+        self.base.assign_u256(region, offset, base)?;
+        self.exponent.assign_u256(region, offset, exponent)?;
         self.exponent_byte_size.assign(region, offset, exponent)?;
         self.insufficient_gas_cost.assign_value(
             region,
@@ -172,9 +175,9 @@ mod tests {
                 EXP
             };
 
-            let gas_cost = OpcodeId::PUSH32.constant_gas_cost().0 * 2
-                + OpcodeId::EXP.constant_gas_cost().0
-                + ((exponent.bits() as u64 + 7) / 8) * GasCost::EXP_BYTE_TIMES.0;
+            let gas_cost = OpcodeId::PUSH32.constant_gas_cost() * 2
+                + OpcodeId::EXP.constant_gas_cost()
+                + ((exponent.bits() as u64 + 7) / 8) * GasCost::EXP_BYTE_TIMES;
 
             Self { bytecode, gas_cost }
         }
@@ -189,7 +192,7 @@ mod tests {
                 txs[0]
                     .from(accs[1].address)
                     .to(accs[0].address)
-                    .gas((GasCost::TX.0 + testing_data.gas_cost - 1).into());
+                    .gas((GasCost::TX + testing_data.gas_cost - 1).into());
             },
             |block, _tx| block.number(0xcafe_u64),
         )

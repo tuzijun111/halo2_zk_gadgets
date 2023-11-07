@@ -66,7 +66,7 @@ impl Opcode for ErrorReturnDataOutOfBound {
             call_id,
             CallContextField::LastCalleeReturnDataLength,
             return_data.len().into(),
-        );
+        )?;
 
         // `IsSuccess` call context operation is added in handle_return
         state.handle_return(&mut exec_step, geth_steps, true)?;
@@ -123,8 +123,8 @@ mod tests {
         .unwrap()
         .into();
 
-        let mut builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
-        builder
+        let builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
+        let builder = builder
             .handle_block(&block.eth_block, &block.geth_traces)
             .unwrap();
 

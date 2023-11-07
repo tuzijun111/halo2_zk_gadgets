@@ -16,11 +16,14 @@ use crate::{
         witness::{Block, Call, ExecStep, Transaction},
     },
     table::CallContextFieldTag,
-    util::Expr,
+    util::{
+        word::{Word, WordCell, WordExpr},
+        Expr,
+    },
 };
 use eth_types::{
     evm_types::{GasCost, OpcodeId},
-    Field, ToScalar, U256,
+    Field, U256,
 };
 use halo2_proofs::{circuit::Value, plonk::Error};
 
@@ -31,14 +34,14 @@ pub(crate) struct ErrorOOGSloadSstoreGadget<F> {
     opcode: Cell<F>,
     tx_id: Cell<F>,
     is_static: Cell<F>,
-    callee_address: Cell<F>,
-    phase2_key: Cell<F>,
-    phase2_value: Cell<F>,
-    phase2_value_prev: Cell<F>,
-    phase2_original_value: Cell<F>,
+    callee_address: WordCell<F>,
+    key: WordCell<F>,
+    value: WordCell<F>,
+    value_prev: WordCell<F>,
+    original_value: WordCell<F>,
     is_warm: Cell<F>,
     is_sstore: PairSelectGadget<F>,
-    sstore_gas_cost: SstoreGasGadget<F>,
+    sstore_gas_cost: SstoreGasGadget<F, WordCell<F>>,
     insufficient_gas_cost: LtGadget<F, N_BYTES_GAS>,
     // Constrain for SSTORE reentrancy sentry.
     insufficient_gas_sentry: LtGadget<F, N_BYTES_GAS>,
@@ -62,43 +65,43 @@ impl<F: Field> ExecutionGadget<F> for ErrorOOGSloadSstoreGadget<F> {
 
         let tx_id = cb.call_context(None, CallContextFieldTag::TxId);
         let is_static = cb.call_context(None, CallContextFieldTag::IsStatic);
-        let callee_address = cb.call_context(None, CallContextFieldTag::CalleeAddress);
+        let callee_address = cb.call_context_read_as_word(None, CallContextFieldTag::CalleeAddress);
 
         // Constrain `is_static` must be false for SSTORE.
         cb.require_zero("is_static == false", is_static.expr() * is_sstore.expr().0);
 
-        let phase2_key = cb.query_cell_phase2();
-        let phase2_value = cb.query_cell_phase2();
-        let phase2_value_prev = cb.query_cell_phase2();
-        let phase2_original_value = cb.query_cell_phase2();
+        let key = cb.query_word_unchecked();
+        let value = cb.query_word_unchecked();
+        let value_prev = cb.query_word_unchecked();
+        let original_value = cb.query_word_unchecked();
         let is_warm = cb.query_bool();
 
-        cb.stack_pop(phase2_key.expr());
+        cb.stack_pop(key.to_word());
         cb.account_storage_access_list_read(
             tx_id.expr(),
-            callee_address.expr(),
-            phase2_key.expr(),
-            is_warm.expr(),
+            callee_address.to_word(),
+            key.to_word(),
+            Word::from_lo_unchecked(is_warm.expr()),
         );
 
         let sload_gas_cost = SloadGasGadget::construct(cb, is_warm.expr());
         let sstore_gas_cost = cb.condition(is_sstore.expr().0, |cb| {
-            cb.stack_pop(phase2_value.expr());
+            cb.stack_pop(value.to_word());
 
             cb.account_storage_read(
-                callee_address.expr(),
-                phase2_key.expr(),
-                phase2_value_prev.expr(),
+                callee_address.to_word(),
+                key.to_word(),
+                value_prev.to_word(),
                 tx_id.expr(),
-                phase2_original_value.expr(),
+                original_value.to_word(),
             );
 
             SstoreGasGadget::construct(
                 cb,
-                phase2_value.clone(),
-                phase2_value_prev.clone(),
-                phase2_original_value.clone(),
                 is_warm.clone(),
+                value.clone(),
+                value_prev.clone(),
+                original_value.clone(),
             )
         });
 
@@ -115,7 +118,7 @@ impl<F: Field> ExecutionGadget<F> for ErrorOOGSloadSstoreGadget<F> {
         let insufficient_gas_sentry = LtGadget::construct(
             cb,
             cb.curr.state.gas_left.expr(),
-            (GasCost::SSTORE_SENTRY.0 + 1).expr(),
+            (GasCost::SSTORE_SENTRY + 1).expr(),
         );
         cb.require_equal(
             "Gas left is less than gas cost or gas sentry (only for SSTORE)",
@@ -126,21 +129,18 @@ impl<F: Field> ExecutionGadget<F> for ErrorOOGSloadSstoreGadget<F> {
             1.expr(),
         );
 
-        let common_error_gadget = CommonErrorGadget::construct(
-            cb,
-            opcode.expr(),
-            7.expr() + 2.expr() * is_sstore.expr().0,
-        );
+        let common_error_gadget =
+            CommonErrorGadget::construct(cb, opcode.expr(), cb.rw_counter_offset());
 
         Self {
             opcode,
             tx_id,
             is_static,
             callee_address,
-            phase2_key,
-            phase2_value,
-            phase2_value_prev,
-            phase2_original_value,
+            key,
+            value,
+            value_prev,
+            original_value,
             is_warm,
             is_sstore,
             sstore_gas_cost,
@@ -159,15 +159,14 @@ impl<F: Field> ExecutionGadget<F> for ErrorOOGSloadSstoreGadget<F> {
         call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        let opcode = step.opcode.unwrap();
+        let opcode = step.opcode().unwrap();
         let is_sstore = opcode == OpcodeId::SSTORE;
-        let key = block.rws[step.rw_indices[3]].stack_value();
-        let (is_warm, _) = block.rws[step.rw_indices[4]].tx_access_list_value_pair();
+        let key = block.get_rws(step, 3).stack_value();
+        let (is_warm, _) = block.get_rws(step, 4).tx_access_list_value_pair();
 
         let (value, value_prev, original_value, gas_cost) = if is_sstore {
-            let value = block.rws[step.rw_indices[5]].stack_value();
-            let (_, value_prev, _, original_value) =
-                block.rws[step.rw_indices[6]].storage_value_aux();
+            let value = block.get_rws(step, 5).stack_value();
+            let (_, value_prev, _, original_value) = block.get_rws(step, 6).storage_value_aux();
             let gas_cost =
                 cal_sstore_gas_cost_for_assignment(value, value_prev, original_value, is_warm);
             (value, value_prev, original_value, gas_cost)
@@ -181,32 +180,22 @@ impl<F: Field> ExecutionGadget<F> for ErrorOOGSloadSstoreGadget<F> {
             is_sstore,
             step.gas_left,
             gas_cost,
-            if is_sstore { GasCost::SSTORE_SENTRY.0 } else { 0 },
+            if is_sstore { GasCost::SSTORE_SENTRY } else { 0 },
         );
 
         self.opcode
             .assign(region, offset, Value::known(F::from(opcode.as_u64())))?;
         self.tx_id
-            .assign(region, offset, Value::known(F::from(tx.id as u64)))?;
+            .assign(region, offset, Value::known(F::from(tx.id)))?;
         self.is_static
             .assign(region, offset, Value::known(F::from(call.is_static as u64)))?;
-        self.callee_address.assign(
-            region,
-            offset,
-            Value::known(
-                call.address
-                    .to_scalar()
-                    .expect("unexpected Address -> Scalar conversion failure"),
-            ),
-        )?;
-        self.phase2_key
-            .assign(region, offset, region.word_rlc(key))?;
-        self.phase2_value
-            .assign(region, offset, region.word_rlc(value))?;
-        self.phase2_value_prev
-            .assign(region, offset, region.word_rlc(value_prev))?;
-        self.phase2_original_value
-            .assign(region, offset, region.word_rlc(original_value))?;
+        self.callee_address
+            .assign_h160(region, offset, call.address)?;
+        self.key.assign_u256(region, offset, key)?;
+        self.value.assign_u256(region, offset, value)?;
+        self.value_prev.assign_u256(region, offset, value_prev)?;
+        self.original_value
+            .assign_u256(region, offset, original_value)?;
         self.is_warm
             .assign(region, offset, Value::known(F::from(is_warm as u64)))?;
 
@@ -229,7 +218,7 @@ impl<F: Field> ExecutionGadget<F> for ErrorOOGSloadSstoreGadget<F> {
             region,
             offset,
             Value::known(F::from(step.gas_left)),
-            Value::known(F::from(GasCost::SSTORE_SENTRY.0.checked_add(1).unwrap())),
+            Value::known(F::from(GasCost::SSTORE_SENTRY.checked_add(1).unwrap())),
         )?;
 
         // Additional one stack pop and one account storage read for SSTORE.
@@ -375,10 +364,7 @@ mod test {
     #[derive(Default)]
     struct TestingData {
         key: U256,
-        value: U256,
-        value_prev: U256,
         original_value: U256,
-        is_warm: bool,
         gas_cost: u64,
         bytecode: Bytecode,
     }
@@ -390,14 +376,14 @@ mod test {
                 SLOAD
             };
             let mut gas_cost =
-                OpcodeId::PUSH32.constant_gas_cost().0 + cal_sload_gas_cost_for_assignment(false);
+                OpcodeId::PUSH32.constant_gas_cost() + cal_sload_gas_cost_for_assignment(false);
             if is_warm {
                 bytecode.append(&bytecode! {
                     PUSH32(key)
                     SLOAD
                 });
-                gas_cost += OpcodeId::PUSH32.constant_gas_cost().0
-                    + cal_sload_gas_cost_for_assignment(true);
+                gas_cost +=
+                    OpcodeId::PUSH32.constant_gas_cost() + cal_sload_gas_cost_for_assignment(true);
             }
 
             Self {
@@ -425,10 +411,10 @@ mod test {
                 original_value,
                 false,
             );
-            let mut gas_cost = 2 * OpcodeId::PUSH32.constant_gas_cost().0
+            let mut gas_cost = 2 * OpcodeId::PUSH32.constant_gas_cost()
                 + max(
                     sstore_gas_cost,
-                    GasCost::SSTORE_SENTRY.0.checked_add(1).unwrap(),
+                    GasCost::SSTORE_SENTRY.checked_add(1).unwrap(),
                 );
             if is_warm {
                 bytecode.append(&bytecode! {
@@ -442,19 +428,16 @@ mod test {
                     original_value,
                     true,
                 );
-                gas_cost += 2 * OpcodeId::PUSH32.constant_gas_cost().0
+                gas_cost += 2 * OpcodeId::PUSH32.constant_gas_cost()
                     + max(
                         sstore_gas_cost,
-                        GasCost::SSTORE_SENTRY.0.checked_add(1).unwrap(),
+                        GasCost::SSTORE_SENTRY.checked_add(1).unwrap(),
                     );
             }
 
             Self {
                 key,
-                value,
-                value_prev,
                 original_value,
-                is_warm,
                 gas_cost,
                 bytecode,
             }
@@ -477,7 +460,7 @@ mod test {
                 txs[0]
                     .from(accs[1].address)
                     .to(accs[0].address)
-                    .gas((GasCost::TX.0 + testing_data.gas_cost - 1).into());
+                    .gas((GasCost::TX + testing_data.gas_cost - 1).into());
             },
             |block, _tx| block.number(0xcafe_u64),
         )

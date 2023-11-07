@@ -28,28 +28,28 @@ impl Opcode for Sload {
             call_id,
             CallContextField::TxId,
             Word::from(state.tx_ctx.id()),
-        );
+        )?;
 
         state.call_context_read(
             &mut exec_step,
             call_id,
             CallContextField::RwCounterEndOfReversion,
             Word::from(state.call()?.rw_counter_end_of_reversion),
-        );
+        )?;
 
         state.call_context_read(
             &mut exec_step,
             call_id,
             CallContextField::IsPersistent,
             Word::from(state.call()?.is_persistent as u8),
-        );
+        )?;
 
         state.call_context_read(
             &mut exec_step,
             call_id,
             CallContextField::CalleeAddress,
             contract_addr.to_word(),
-        );
+        )?;
 
         // First stack read
         let key = geth_step.stack.last()?;
@@ -78,10 +78,21 @@ impl Opcode for Sload {
                 state.tx_ctx.id(),
                 committed_value,
             ),
-        );
+        )?;
 
         // First stack write
         state.stack_write(&mut exec_step, stack_position, value)?;
+        state.push_op(
+            &mut exec_step,
+            RW::READ,
+            TxAccessListAccountStorageOp {
+                tx_id: state.tx_ctx.id(),
+                address: contract_addr,
+                key,
+                is_warm,
+                is_warm_prev: is_warm,
+            },
+        )?;
         state.push_op_reversible(
             &mut exec_step,
             TxAccessListAccountStorageOp {
@@ -145,8 +156,8 @@ mod sload_tests {
         .unwrap()
         .into();
 
-        let mut builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
-        builder
+        let builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
+        let builder = builder
             .handle_block(&block.eth_block, &block.geth_traces)
             .unwrap();
 
@@ -189,7 +200,7 @@ mod sload_tests {
         );
 
         let access_list_op = &builder.block.container.tx_access_list_account_storage
-            [step.bus_mapping_instance[7].as_usize()];
+            [step.bus_mapping_instance[8].as_usize()];
         assert_eq!(
             (access_list_op.rw(), access_list_op.op()),
             (

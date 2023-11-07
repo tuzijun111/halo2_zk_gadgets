@@ -1,9 +1,9 @@
 use crate::{
     evm_circuit::util::{
         constraint_builder::{ConstrainBuilderCommon, EVMConstraintBuilder},
-        CachedRegion, Cell,
+        CachedRegion,
     },
-    util::Expr,
+    util::{cell_manager::Cell, Expr},
 };
 use eth_types::Field;
 use halo2_proofs::{
@@ -53,10 +53,10 @@ impl<F: Field> PairSelectGadget<F> {
         a: F,
         _b: F,
     ) -> Result<(F, F), Error> {
-        let is_a = if value == a { F::one() } else { F::zero() };
+        let is_a = if value == a { F::ONE } else { F::ZERO };
         self.is_a.assign(region, offset, Value::known(is_a))?;
 
-        Ok((is_a, F::one() - is_a))
+        Ok((is_a, F::ONE - is_a))
     }
 }
 

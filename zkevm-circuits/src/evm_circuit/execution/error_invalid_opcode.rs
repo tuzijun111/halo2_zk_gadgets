@@ -39,7 +39,7 @@ impl<F: Field> ExecutionGadget<F> for ErrorInvalidOpcodeGadget<F> {
             },
         );
 
-        let common_error_gadget = CommonErrorGadget::construct(cb, opcode.expr(), 2.expr());
+        let common_error_gadget = CommonErrorGadget::construct(cb, opcode.expr(), 0.expr());
 
         Self {
             opcode,
@@ -56,7 +56,7 @@ impl<F: Field> ExecutionGadget<F> for ErrorInvalidOpcodeGadget<F> {
         call: &Call,
         step: &ExecStep,
     ) -> Result<(), Error> {
-        let opcode = F::from(step.opcode.unwrap().as_u64());
+        let opcode = F::from(step.opcode().unwrap().as_u64());
         self.opcode.assign(region, offset, Value::known(opcode))?;
 
         self.common_error_gadget
@@ -81,7 +81,7 @@ mod test {
             vec![0xf6],
             vec![0xfe],
             // Multiple invalid opcodes
-            vec![0x5c, 0x5e, 0x5f],
+            vec![0x5c, 0x5e],
         ];
     }
 

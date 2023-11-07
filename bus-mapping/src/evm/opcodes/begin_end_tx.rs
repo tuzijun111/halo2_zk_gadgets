@@ -6,7 +6,7 @@ use crate::{
     Error,
 };
 use eth_types::{
-    evm_types::{GasCost, MAX_REFUND_QUOTIENT_OF_GAS_USED},
+    evm_types::{GasCost, MAX_REFUND_QUOTIENT_OF_GAS_USED, PRECOMPILE_COUNT},
     evm_unimplemented, ToWord, Word,
 };
 use ethers_core::utils::get_contract_address;
@@ -45,7 +45,7 @@ fn gen_begin_tx_steps(state: &mut CircuitInputStateRef) -> Result<ExecStep, Erro
         ),
         (CallContextField::IsSuccess, call.is_success.to_word()),
     ] {
-        state.call_context_write(&mut exec_step, call.call_id, field, value);
+        state.call_context_write(&mut exec_step, call.call_id, field, value)?;
     }
 
     // Increase caller's nonce
@@ -55,12 +55,14 @@ fn gen_begin_tx_steps(state: &mut CircuitInputStateRef) -> Result<ExecStep, Erro
         &mut exec_step,
         caller_address,
         AccountField::Nonce,
-        nonce_prev + 1,
-        nonce_prev,
+        (nonce_prev + 1).into(),
+        nonce_prev.into(),
+        false,
     )?;
 
-    // Add caller and callee into access list
-    for address in [call.caller_address, call.address] {
+    // Add precompile contract address to access list
+    for address in 1..=PRECOMPILE_COUNT {
+        let address = eth_types::Address::from_low_u64_be(address);
         let is_warm_prev = !state.sdb.add_account_to_access_list(address);
         state.tx_accesslist_account_write(
             &mut exec_step,
@@ -71,12 +73,32 @@ fn gen_begin_tx_steps(state: &mut CircuitInputStateRef) -> Result<ExecStep, Erro
         )?;
     }
 
-    let intrinsic_gas_cost = if state.tx.is_create() {
-        GasCost::CREATION_TX.as_u64()
+    // Add caller, callee and coinbase (for EIP-3651) to access list.
+    for address in [call.caller_address, call.address, state.block.coinbase] {
+        let is_warm_prev = !state.sdb.add_account_to_access_list(address);
+        state.tx_accesslist_account_write(
+            &mut exec_step,
+            state.tx_ctx.id(),
+            address,
+            true,
+            is_warm_prev,
+        )?;
+    }
+
+    let init_code_gas_cost = if state.tx.is_create() {
+        // Calculate gas cost of init code for EIP-3860.
+        (state.tx.call_data.len() as u64 + 31) / 32 * eth_types::evm_types::INIT_CODE_WORD_GAS
     } else {
-        GasCost::TX.as_u64()
-    } + state.tx.tx.call_data_gas_cost();
-    exec_step.gas_cost = GasCost(intrinsic_gas_cost);
+        0
+    };
+
+    let intrinsic_gas_cost = if state.tx.is_create() {
+        GasCost::CREATION_TX
+    } else {
+        GasCost::TX
+    } + state.tx.call_data_gas_cost()
+        + init_code_gas_cost;
+    exec_step.gas_cost = intrinsic_gas_cost;
 
     // Get code_hash of callee
     let (_, callee_account) = state.sdb.get_account(&call.address);
@@ -89,13 +111,13 @@ fn gen_begin_tx_steps(state: &mut CircuitInputStateRef) -> Result<ExecStep, Erro
     } else {
         (Word::zero(), true)
     };
-    if !state.is_precompiled(&call.address) && !call.is_create() {
+    if !state.is_precompiled(&call.address) {
         state.account_read(
             &mut exec_step,
             call.address,
             AccountField::CodeHash,
             callee_code_hash,
-        );
+        )?;
     }
 
     // Transfer with fee
@@ -106,7 +128,7 @@ fn gen_begin_tx_steps(state: &mut CircuitInputStateRef) -> Result<ExecStep, Erro
         callee_exists,
         call.is_create(),
         call.value,
-        Some(state.tx.tx.gas_price * state.tx.gas()),
+        Some(state.tx.gas_price * state.tx.gas()),
     )?;
 
     // In case of contract creation we wish to verify the correctness of the
@@ -160,7 +182,7 @@ fn gen_begin_tx_steps(state: &mut CircuitInputStateRef) -> Result<ExecStep, Erro
                 ),
                 (
                     CallContextField::CallDataLength,
-                    state.tx.tx.call_data.len().into(),
+                    state.tx.call_data.len().into(),
                 ),
                 (CallContextField::Value, call.value),
                 (CallContextField::IsStatic, (call.is_static as usize).into()),
@@ -171,7 +193,7 @@ fn gen_begin_tx_steps(state: &mut CircuitInputStateRef) -> Result<ExecStep, Erro
                 (CallContextField::IsCreate, 1.into()),
                 (CallContextField::CodeHash, call.code_hash.to_word()),
             ] {
-                state.call_context_write(&mut exec_step, call.call_id, field, value);
+                state.call_context_write(&mut exec_step, call.call_id, field, value)?;
             }
             Ok(exec_step)
         }
@@ -211,7 +233,7 @@ fn gen_begin_tx_steps(state: &mut CircuitInputStateRef) -> Result<ExecStep, Erro
                 (CallContextField::IsCreate, 0.into()),
                 (CallContextField::CodeHash, callee_code_hash),
             ] {
-                state.call_context_write(&mut exec_step, call.call_id, field, value);
+                state.call_context_write(&mut exec_step, call.call_id, field, value)?;
             }
 
             Ok(exec_step)
@@ -228,13 +250,13 @@ fn gen_end_tx_steps(state: &mut CircuitInputStateRef) -> Result<ExecStep, Error>
         call.call_id,
         CallContextField::TxId,
         state.tx_ctx.id().into(),
-    );
+    )?;
     state.call_context_read(
         &mut exec_step,
         call.call_id,
         CallContextField::IsPersistent,
         Word::from(call.is_persistent as u8),
-    );
+    )?;
 
     let refund = state.sdb.refund();
     state.push_op(
@@ -245,39 +267,50 @@ fn gen_end_tx_steps(state: &mut CircuitInputStateRef) -> Result<ExecStep, Error>
             value: refund,
             value_prev: refund,
         },
-    );
+    )?;
 
-    let effective_refund = refund
-        .min((state.tx.gas() - exec_step.gas_left.0) / MAX_REFUND_QUOTIENT_OF_GAS_USED as u64);
+    let effective_refund =
+        refund.min((state.tx.gas() - exec_step.gas_left) / MAX_REFUND_QUOTIENT_OF_GAS_USED as u64);
     let (found, caller_account) = state.sdb.get_account(&call.caller_address);
     if !found {
         return Err(Error::AccountNotFound(call.caller_address));
     }
     let caller_balance_prev = caller_account.balance;
     let caller_balance =
-        caller_balance_prev + state.tx.tx.gas_price * (exec_step.gas_left.0 + effective_refund);
+        caller_balance_prev + state.tx.gas_price * (exec_step.gas_left + effective_refund);
     state.account_write(
         &mut exec_step,
         call.caller_address,
         AccountField::Balance,
         caller_balance,
         caller_balance_prev,
+        false,
     )?;
 
-    let effective_tip = state.tx.tx.gas_price - state.block.base_fee;
+    let effective_tip = state.tx.gas_price - state.block.base_fee;
     let (found, coinbase_account) = state.sdb.get_account(&state.block.coinbase);
     if !found {
         return Err(Error::AccountNotFound(state.block.coinbase));
     }
-    let coinbase_balance_prev = coinbase_account.balance;
-    let coinbase_balance =
-        coinbase_balance_prev + effective_tip * (state.tx.gas() - exec_step.gas_left.0);
-    state.account_write(
+    let coinbase_exist = !coinbase_account.is_empty();
+    let coinbase_transfer_value = effective_tip * (state.tx.gas() - exec_step.gas_left);
+    state.account_read(
         &mut exec_step,
         state.block.coinbase,
-        AccountField::Balance,
-        coinbase_balance,
-        coinbase_balance_prev,
+        AccountField::CodeHash,
+        if coinbase_account.is_empty() {
+            Word::zero()
+        } else {
+            coinbase_account.code_hash.to_word()
+        },
+    )?;
+    state.transfer_to(
+        &mut exec_step,
+        state.block.coinbase,
+        coinbase_exist,
+        false,
+        coinbase_transfer_value,
+        false,
     )?;
 
     // handle tx receipt tag
@@ -306,7 +339,7 @@ fn gen_end_tx_steps(state: &mut CircuitInputStateRef) -> Result<ExecStep, Error>
         )?;
     }
 
-    state.block_ctx.cumulative_gas_used += state.tx.gas() - exec_step.gas_left.0;
+    state.block_ctx.cumulative_gas_used += state.tx.gas() - exec_step.gas_left;
     state.tx_receipt_write(
         &mut exec_step,
         state.tx_ctx.id(),
@@ -320,7 +353,7 @@ fn gen_end_tx_steps(state: &mut CircuitInputStateRef) -> Result<ExecStep, Error>
             state.block_ctx.rwc.0 + 1,
             CallContextField::TxId,
             (state.tx_ctx.id() + 1).into(),
-        );
+        )?;
     }
 
     Ok(exec_step)

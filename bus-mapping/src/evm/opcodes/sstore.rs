@@ -1,10 +1,9 @@
 use super::Opcode;
 use crate::{
     circuit_input_builder::{CircuitInputStateRef, ExecStep},
-    operation::{CallContextField, StorageOp, TxAccessListAccountStorageOp, TxRefundOp},
+    operation::{CallContextField, StorageOp, TxAccessListAccountStorageOp, TxRefundOp, RW},
     Error,
 };
-
 use eth_types::{GethExecStep, ToWord, Word};
 
 /// Placeholder structure used to implement [`Opcode`] trait over it
@@ -28,34 +27,34 @@ impl Opcode for Sstore {
             state.call()?.call_id,
             CallContextField::TxId,
             Word::from(state.tx_ctx.id()),
-        );
+        )?;
         state.call_context_read(
             &mut exec_step,
             state.call()?.call_id,
             CallContextField::IsStatic,
             Word::from(state.call()?.is_static as u8),
-        );
+        )?;
 
         state.call_context_read(
             &mut exec_step,
             state.call()?.call_id,
             CallContextField::RwCounterEndOfReversion,
             Word::from(state.call()?.rw_counter_end_of_reversion),
-        );
+        )?;
 
         state.call_context_read(
             &mut exec_step,
             state.call()?.call_id,
             CallContextField::IsPersistent,
             Word::from(state.call()?.is_persistent as u8),
-        );
+        )?;
 
         state.call_context_read(
             &mut exec_step,
             state.call()?.call_id,
             CallContextField::CalleeAddress,
             state.call()?.address.to_word(),
-        );
+        )?;
 
         let key = geth_step.stack.nth_last(0)?;
         let key_stack_position = geth_step.stack.nth_last_filled(0);
@@ -86,6 +85,17 @@ impl Opcode for Sstore {
             ),
         )?;
 
+        state.push_op(
+            &mut exec_step,
+            RW::READ,
+            TxAccessListAccountStorageOp {
+                tx_id: state.tx_ctx.id(),
+                address: contract_addr,
+                key,
+                is_warm,
+                is_warm_prev: is_warm,
+            },
+        )?;
         state.push_op_reversible(
             &mut exec_step,
             TxAccessListAccountStorageOp {
@@ -102,7 +112,7 @@ impl Opcode for Sstore {
             TxRefundOp {
                 tx_id: state.tx_ctx.id(),
                 value_prev: state.sdb.refund(),
-                value: geth_step.refund.0,
+                value: geth_step.refund,
             },
         )?;
 
@@ -170,8 +180,8 @@ mod sstore_tests {
         .unwrap()
         .into();
 
-        let mut builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
-        builder
+        let builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
+        let builder = builder
             .handle_block(&block.eth_block, &block.geth_traces)
             .unwrap();
 
@@ -250,7 +260,8 @@ mod sstore_tests {
                 )
             )
         );
-        let refund_op = &builder.block.container.tx_refund[step.bus_mapping_instance[9].as_usize()];
+        let refund_op =
+            &builder.block.container.tx_refund[step.bus_mapping_instance[10].as_usize()];
         assert_eq!(
             (refund_op.rw(), refund_op.op()),
             (

@@ -6,12 +6,11 @@ use crate::{
     state_db::CodeDB,
     Error,
 };
-use eth_types::{Bytecode, GethExecStep, ToWord, H256};
+use eth_types::{evm_types::INVALID_INIT_CODE_FIRST_BYTE, Bytecode, GethExecStep, ToWord, H256};
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct ReturnRevert;
 
-// TODO: rename to indicate this handles REVERT (and maybe STOP)?
 impl Opcode for ReturnRevert {
     fn gen_associated_ops(
         state: &mut CircuitInputStateRef,
@@ -38,13 +37,20 @@ impl Opcode for ReturnRevert {
             call.call_id,
             CallContextField::IsSuccess,
             call.is_success.to_word(),
-        );
+        )?;
 
-        let offset = offset.as_usize();
+        // Get low Uint64 of offset to generate copy steps. Since offset could
+        // be Uint64 overflow if length is zero.
+        let offset = offset.low_u64() as usize;
         let length = length.as_usize();
 
         // Case A in the spec.
         if call.is_create() && call.is_success && length > 0 {
+            // Read the first byte of init code and check it must not be 0xef (EIP-3541).
+            let init_code_first_byte = state.call_ctx()?.memory.0[offset];
+            state.memory_read(&mut exec_step, offset.into(), init_code_first_byte)?;
+            assert_ne!(init_code_first_byte, INVALID_INIT_CODE_FIRST_BYTE);
+
             // Note: handle_return updates state.code_db. All we need to do here is push the
             // copy event.
             let code_hash = handle_create(
@@ -66,7 +72,7 @@ impl Opcode for ReturnRevert {
                 ),
                 (CallContextField::IsPersistent, call.is_persistent.to_word()),
             ] {
-                state.call_context_read(&mut exec_step, state.call()?.call_id, field, value);
+                state.call_context_read(&mut exec_step, state.call()?.call_id, field, value)?;
             }
 
             state.push_op_reversible(
@@ -87,7 +93,7 @@ impl Opcode for ReturnRevert {
                 call.call_id,
                 CallContextField::IsPersistent,
                 call.is_persistent.to_word(),
-            );
+            )?;
         }
 
         // Case C in the specs.
@@ -101,7 +107,7 @@ impl Opcode for ReturnRevert {
                 (CallContextField::ReturnDataOffset, call.return_data_offset),
                 (CallContextField::ReturnDataLength, call.return_data_length),
             ] {
-                state.call_context_read(&mut exec_step, call.call_id, field, value.into());
+                state.call_context_read(&mut exec_step, call.call_id, field, value.into())?;
             }
 
             let return_data_length = usize::try_from(call.return_data_length).unwrap();
@@ -167,12 +173,12 @@ fn handle_copy(
             step,
             RW::READ,
             MemoryOp::new(source.id, (source.offset + i).into(), *byte),
-        );
+        )?;
         state.push_op(
             step,
             RW::WRITE,
             MemoryOp::new(destination.id, (destination.offset + i).into(), *byte),
-        );
+        )?;
     }
 
     state.push_copy(
@@ -200,21 +206,17 @@ fn handle_create(
     source: Source,
 ) -> Result<H256, Error> {
     let values = state.call_ctx()?.memory.0[source.offset..source.offset + source.length].to_vec();
-    let code_hash = CodeDB::hash(&values);
+    let bytecode = Bytecode::from(values);
+    let code_hash = bytecode.hash_h256();
+    let bytes = bytecode.code_vec();
     let dst_id = NumberOrHash::Hash(code_hash);
-    let bytes: Vec<_> = Bytecode::from(values)
-        .code
-        .iter()
-        .map(|element| (element.value, element.is_code))
-        .collect();
-
     let rw_counter_start = state.block_ctx.rwc;
     for (i, (byte, _)) in bytes.iter().enumerate() {
         state.push_op(
             step,
             RW::READ,
             MemoryOp::new(source.id, (source.offset + i).into(), *byte),
-        );
+        )?;
     }
 
     state.push_copy(
@@ -277,7 +279,7 @@ mod return_tests {
         .unwrap()
         .into();
 
-        let mut builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
+        let builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
         builder
             .handle_block(&block.eth_block, &block.geth_traces)
             .unwrap();
@@ -335,7 +337,7 @@ mod return_tests {
         .unwrap()
         .into();
 
-        let mut builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
+        let builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
         builder
             .handle_block(&block.eth_block, &block.geth_traces)
             .unwrap();

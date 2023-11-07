@@ -1,17 +1,16 @@
 use super::*;
 use crate::{
     circuit_input_builder::access::gen_state_access_trace,
-    error::{ExecError, OogError},
+    error::{DepthError, ExecError, InsufficientBalanceError, OogError},
     geth_errors::{
         GETH_ERR_GAS_UINT_OVERFLOW, GETH_ERR_OUT_OF_GAS, GETH_ERR_STACK_OVERFLOW,
         GETH_ERR_STACK_UNDERFLOW,
     },
-    operation::RWCounter,
     state_db::Account,
 };
 use eth_types::{
     address, bytecode,
-    evm_types::{stack::Stack, Gas, OpcodeId},
+    evm_types::{stack::Stack, OpcodeId, INVALID_INIT_CODE_FIRST_BYTE},
     geth_types::GethData,
     word, Bytecode, Hash, ToAddress, ToWord, Word,
 };
@@ -23,15 +22,14 @@ use mock::{
 use pretty_assertions::assert_eq;
 use std::collections::HashSet;
 
-// Helper struct that contains a CircuitInputBuilder, a particuar tx and a
+// Helper struct that contains a CircuitInputBuilder, a particular tx and a
 // particular execution step so that we can easily get a
 // CircuitInputStateRef to have a context in order to get the error at a
 // given step.
 struct CircuitInputBuilderTx {
-    builder: CircuitInputBuilder,
+    builder: CircuitInputBuilder<DynamicCParams>,
     tx: Transaction,
     pub(crate) tx_ctx: TransactionContext,
-    step: ExecStep,
 }
 
 impl CircuitInputBuilderTx {
@@ -39,12 +37,12 @@ impl CircuitInputBuilderTx {
         let block = crate::mock::BlockData::new_from_geth_data(geth_data.clone());
         let mut builder = block.new_circuit_input_builder();
         let tx = builder
-            .new_tx(&block.eth_block.transactions[0], true)
+            .new_tx(0, &block.eth_block.transactions[0], true)
             .unwrap();
         let tx_ctx = TransactionContext::new(
             &block.eth_block.transactions[0],
             &GethExecTrace {
-                gas: Gas(0),
+                gas: 0,
                 failed: false,
                 return_value: "".to_owned(),
                 struct_logs: vec![geth_step.clone()],
@@ -53,19 +51,10 @@ impl CircuitInputBuilderTx {
         )
         .unwrap();
 
-        let prev_log_id = if tx.is_steps_empty() {
-            0
-        } else {
-            tx.last_step().log_id
-        };
-
-        let call_ctx = tx_ctx.call_ctx().unwrap();
-        let exec_step = ExecStep::new(geth_step, call_ctx, RWCounter::new(), 0, prev_log_id);
         Self {
             builder,
             tx,
             tx_ctx,
-            step: exec_step,
         }
     }
 
@@ -219,7 +208,7 @@ fn tracer_err_depth() {
     let mut builder = CircuitInputBuilderTx::new(&block, step);
     assert_eq!(
         builder.state_ref().get_step_err(step, next_step).unwrap(),
-        Some(ExecError::Depth)
+        Some(ExecError::Depth(DepthError::Call))
     );
 }
 
@@ -261,10 +250,7 @@ fn tracer_err_insufficient_balance() {
         },
         |mut txs, accs| {
             txs[0].to(accs[0].address).from(accs[2].address);
-            txs[1]
-                .to(accs[1].address)
-                .from(accs[2].address)
-                .nonce(Word::one());
+            txs[1].to(accs[1].address).from(accs[2].address);
         },
         |block, _tx| block.number(0xcafeu64),
         LoggerConfig::enable_memory(),
@@ -288,7 +274,9 @@ fn tracer_err_insufficient_balance() {
     let mut builder = CircuitInputBuilderTx::new(&block, step);
     assert_eq!(
         builder.state_ref().get_step_err(step, next_step).unwrap(),
-        Some(ExecError::InsufficientBalance)
+        Some(ExecError::InsufficientBalance(
+            InsufficientBalanceError::Call
+        ))
     );
 }
 
@@ -376,17 +364,8 @@ fn tracer_err_address_collision() {
     };
 
     let mut code_b = Bytecode::default();
-    // pad code_creator to multiple of 32 bytes
-    let len = code_creator.to_vec().len();
-    let code_creator: Vec<u8> = code_creator
-        .to_vec()
-        .iter()
-        .cloned()
-        .chain(0u8..((32 - len % 32) as u8))
-        .collect();
-    for (index, word) in code_creator.chunks(32).enumerate() {
-        code_b.op_mstore(index * 32, Word::from_big_endian(word));
-    }
+    code_b.store_code_to_mem(&code_creator);
+    let len = code_creator.codesize();
     let code_b_end = bytecode! {
         PUSH3(0x123456) // salt
         PUSH1(len) // length
@@ -417,10 +396,7 @@ fn tracer_err_address_collision() {
         },
         |mut txs, accs| {
             txs[0].to(accs[0].address).from(accs[2].address);
-            txs[1]
-                .to(accs[1].address)
-                .from(accs[2].address)
-                .nonce(Word::one());
+            txs[1].to(accs[1].address).from(accs[2].address);
         },
         |block, _tx| block.number(0xcafeu64),
         LoggerConfig::enable_memory(),
@@ -501,17 +477,8 @@ fn tracer_create_collision_free() {
     };
 
     let mut code_b = Bytecode::default();
-    // pad code_creator to multiple of 32 bytes
-    let len = code_creator.to_vec().len();
-    let code_creator: Vec<u8> = code_creator
-        .to_vec()
-        .iter()
-        .cloned()
-        .chain(0u8..((32 - len % 32) as u8))
-        .collect();
-    for (index, word) in code_creator.chunks(32).enumerate() {
-        code_b.op_mstore(index * 32, Word::from_big_endian(word));
-    }
+    code_b.store_code_to_mem(&code_creator);
+    let len = code_creator.codesize();
     let code_b_end = bytecode! {
         PUSH1(len) // length
         PUSH1(0x00) // offset
@@ -540,10 +507,7 @@ fn tracer_create_collision_free() {
         },
         |mut txs, accs| {
             txs[0].to(accs[0].address).from(accs[2].address);
-            txs[1]
-                .to(accs[1].address)
-                .from(accs[2].address)
-                .nonce(Word::one());
+            txs[1].to(accs[1].address).from(accs[2].address);
         },
         |block, _tx| block.number(0xcafeu64),
         LoggerConfig::enable_memory(),
@@ -584,7 +548,7 @@ fn tracer_create_collision_free() {
     builder.builder.sdb.set_account(
         &ADDR_B,
         Account {
-            nonce: Word::zero(),
+            nonce: 0,
             balance: Word::from(555u64), /* same value as in
                                           * `mock::new_tracer_account` */
             storage: HashMap::new(),
@@ -594,7 +558,7 @@ fn tracer_create_collision_free() {
     builder.builder.sdb.set_account(
         &create_address,
         Account {
-            nonce: Word::zero(),
+            nonce: 0,
             balance: Word::zero(),
             storage: HashMap::new(),
             code_hash: Hash::zero(),
@@ -611,7 +575,7 @@ fn check_err_code_store_out_of_gas(step: &GethExecStep, next_step: Option<&GethE
     step.op == OpcodeId::RETURN
         && step.error.is_none()
         && result(next_step).is_zero()
-        && Word::from(200) * length > Word::from(step.gas.0)
+        && Word::from(200) * length > Word::from(step.gas)
 }
 
 #[test]
@@ -639,19 +603,9 @@ fn tracer_err_code_store_out_of_gas() {
     };
 
     let mut code_b = Bytecode::default();
-    // pad code_creator to multiple of 32 bytes
-    let len = code_creator.to_vec().len();
-    let code_creator: Vec<u8> = code_creator
-        .to_vec()
-        .iter()
-        .cloned()
-        .chain(0..(32 - len % 32) as u8)
-        .collect();
-    for (index, word) in code_creator.chunks(32).enumerate() {
-        code_b.op_mstore(index * 32, Word::from_big_endian(word));
-    }
+    code_b.store_code_to_mem(&code_creator);
     let code_b_end = bytecode! {
-        PUSH32(len) // length
+        PUSH32(code_creator.codesize()) // length
         PUSH1(0x00) // offset
         PUSH1(0x00) // value
         CREATE
@@ -673,10 +627,7 @@ fn tracer_err_code_store_out_of_gas() {
         },
         |mut txs, accs| {
             txs[0].to(accs[0].address).from(accs[2].address);
-            txs[1]
-                .to(accs[1].address)
-                .from(accs[2].address)
-                .nonce(Word::one());
+            txs[1].to(accs[1].address).from(accs[2].address);
         },
         |block, _tx| block.number(0xcafeu64),
         LoggerConfig::enable_memory(),
@@ -726,7 +677,6 @@ fn tracer_err_code_store_out_of_gas_tx_deploy() {
             txs[0]
                 .from(accs[1].address)
                 .gas(55000u64.into())
-                .nonce(Word::zero())
                 .input(code_creator.into());
         },
         |block, _tx| block.number(0x0264),
@@ -764,11 +714,11 @@ fn check_err_invalid_code(step: &GethExecStep, next_step: Option<&GethExecStep>)
         && result(next_step).is_zero()
         && length > Word::zero()
         && !step.memory.is_empty()
-        && step.memory.0.get(offset.low_u64() as usize) == Some(&0xef)
+        && step.memory.0.get(offset.low_u64() as usize) == Some(&INVALID_INIT_CODE_FIRST_BYTE)
 }
 
 #[test]
-fn tracer_err_invalid_code() {
+fn tracer_err_invalid_code_for_create_opcode() {
     // code_creator outputs byte array that starts with 0xef, which is
     // invalid code.
     let code_creator = bytecode! {
@@ -791,17 +741,8 @@ fn tracer_err_invalid_code() {
     };
 
     let mut code_b = Bytecode::default();
-    // pad code_creator to multiple of 32 bytes
-    let len = code_creator.to_vec().len();
-    let code_creator: Vec<u8> = code_creator
-        .to_vec()
-        .iter()
-        .cloned()
-        .chain(0u8..((32 - len % 32) as u8))
-        .collect();
-    for (index, word) in code_creator.chunks(32).enumerate() {
-        code_b.op_mstore(index * 32, Word::from_big_endian(word));
-    }
+    code_b.store_code_to_mem(&code_creator);
+    let len = code_creator.codesize();
     let code_b_end = bytecode! {
         PUSH1(len) // length
         PUSH1(0x00) // offset
@@ -825,10 +766,7 @@ fn tracer_err_invalid_code() {
         },
         |mut txs, accs| {
             txs[0].to(accs[0].address).from(accs[2].address);
-            txs[1]
-                .to(accs[1].address)
-                .from(accs[2].address)
-                .nonce(Word::one());
+            txs[1].to(accs[1].address).from(accs[2].address);
         },
         |block, _tx| block.number(0xcafeu64),
         LoggerConfig::enable_memory(),
@@ -851,6 +789,61 @@ fn tracer_err_invalid_code() {
     // Set up call context at RETURN
     builder.tx_ctx.call_is_success.push(false);
     builder.state_ref().push_call(mock_internal_create());
+    builder.state_ref().call_ctx_mut().unwrap().memory = step.memory.clone();
+    assert_eq!(
+        builder.state_ref().get_step_err(step, next_step).unwrap(),
+        Some(ExecError::InvalidCreationCode)
+    );
+}
+
+// Test ErrInvalidCode in transaction deployment (`tx.to == null`).
+#[test]
+fn tracer_err_invalid_code_for_tx_deployment() {
+    // Code creator outputs a byte array that starts with 0xef, which is the
+    // invalid code.
+    let code_creator = bytecode! {
+        PUSH32(word!("0xef00000000000000000000000000000000000000000000000000000000000000")) // value
+        PUSH1(0x00) // offset
+        MSTORE
+        PUSH1(0x01) // length
+        PUSH1(0x00) // offset
+        RETURN
+    };
+
+    // Get the execution steps from external tracer.
+    let block: GethData = TestContext::<2, 1>::new_with_logger_config(
+        None,
+        |accs| {
+            accs[0].address(address!("0x0000000000000000000000000000000000000000"));
+            accs[1].address(*ADDR_B).balance(Word::from(1u64 << 30));
+        },
+        |mut txs, accs| {
+            txs[0]
+                .from(accs[1].address)
+                .gas(60000u64.into())
+                .input(code_creator.into());
+        },
+        |block, _tx| block.number(0x0264),
+        LoggerConfig::enable_memory(),
+    )
+    .unwrap()
+    .into();
+
+    // Get last RETURN.
+    let (index, step) = block.geth_traces[0]
+        .struct_logs
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, s)| s.op == OpcodeId::RETURN)
+        .unwrap();
+    let next_step = block.geth_traces[0].struct_logs.get(index + 1);
+    assert!(check_err_invalid_code(step, next_step));
+
+    // Setup call context at RETURN.
+    let mut builder = CircuitInputBuilderTx::new(&block, step);
+    builder.tx_ctx.call_is_success.push(false);
+    builder.state_ref().push_call(mock_root_create());
     builder.state_ref().call_ctx_mut().unwrap().memory = step.memory.clone();
     assert_eq!(
         builder.state_ref().get_step_err(step, next_step).unwrap(),
@@ -891,19 +884,9 @@ fn tracer_err_max_code_size_exceeded() {
     };
 
     let mut code_b = Bytecode::default();
-    // pad code_creator to multiple of 32 bytes
-    let len = code_creator.to_vec().len();
-    let code_creator: Vec<u8> = code_creator
-        .to_vec()
-        .iter()
-        .cloned()
-        .chain(0u8..((32 - len % 32) as u8))
-        .collect();
-    for (index, word) in code_creator.chunks(32).enumerate() {
-        code_b.op_mstore(index * 32, Word::from_big_endian(word));
-    }
+    code_b.store_code_to_mem(&code_creator);
     let code_b_end = bytecode! {
-        PUSH32(len) // length
+        PUSH32(code_creator.codesize()) // length
         PUSH1(0x00) // offset
         PUSH1(0x00) // value
         CREATE
@@ -925,10 +908,7 @@ fn tracer_err_max_code_size_exceeded() {
         },
         |mut txs, accs| {
             txs[0].to(accs[0].address).from(accs[2].address);
-            txs[1]
-                .to(accs[1].address)
-                .from(accs[2].address)
-                .nonce(Word::one());
+            txs[1].to(accs[1].address).from(accs[2].address);
         },
         |block, _tx| block.number(0xcafeu64),
         LoggerConfig::enable_memory(),
@@ -978,7 +958,6 @@ fn tracer_err_max_code_size_exceeded_tx_deploy() {
             txs[0]
                 .from(accs[1].address)
                 .gas(60000u64.into())
-                .nonce(Word::zero())
                 .input(code_creator.into());
         },
         |block, _tx| block.number(0x0264),
@@ -1033,19 +1012,9 @@ fn tracer_create_stop() {
     };
 
     let mut code_b = Bytecode::default();
-    // pad code_creator to multiple of 32 bytes
-    let len = code_creator.to_vec().len();
-    let code_creator: Vec<u8> = code_creator
-        .to_vec()
-        .iter()
-        .cloned()
-        .chain(0u8..((32 - len % 32) as u8))
-        .collect();
-    for (index, word) in code_creator.chunks(32).enumerate() {
-        code_b.op_mstore(index * 32, Word::from_big_endian(word));
-    }
+    code_b.store_code_to_mem(&code_creator);
     let code_b_end = bytecode! {
-        PUSH1(len) // length
+        PUSH1(code_creator.codesize()) // length
         PUSH1(0x00) // offset
         PUSH1(0x00) // value
         CREATE
@@ -1069,10 +1038,7 @@ fn tracer_create_stop() {
         },
         |mut txs, accs| {
             txs[0].to(accs[0].address).from(accs[2].address);
-            txs[1]
-                .to(accs[1].address)
-                .from(accs[2].address)
-                .nonce(Word::one());
+            txs[1].to(accs[1].address).from(accs[2].address);
         },
         |block, _tx| block.number(0xcafeu64),
         LoggerConfig::enable_memory(),
@@ -1190,10 +1156,7 @@ fn tracer_err_invalid_jump() {
         },
         |mut txs, accs| {
             txs[0].to(accs[0].address).from(accs[2].address);
-            txs[1]
-                .to(accs[1].address)
-                .from(accs[2].address)
-                .nonce(Word::one());
+            txs[1].to(accs[1].address).from(accs[2].address);
         },
         |block, _tx| block.number(0xcafeu64),
         LoggerConfig::enable_memory(),
@@ -1293,10 +1256,7 @@ fn tracer_err_execution_reverted() {
         },
         |mut txs, accs| {
             txs[0].to(accs[0].address).from(accs[2].address);
-            txs[1]
-                .to(accs[1].address)
-                .from(accs[2].address)
-                .nonce(Word::one());
+            txs[1].to(accs[1].address).from(accs[2].address);
         },
         |block, _tx| block.number(0xcafeu64),
         LoggerConfig::enable_memory(),
@@ -1355,10 +1315,7 @@ fn tracer_stop() {
         },
         |mut txs, accs| {
             txs[0].to(accs[0].address).from(accs[2].address);
-            txs[1]
-                .to(accs[1].address)
-                .from(accs[2].address)
-                .nonce(Word::one());
+            txs[1].to(accs[1].address).from(accs[2].address);
         },
         |block, _tx| block.number(0xcafeu64),
         LoggerConfig::enable_memory(),
@@ -1426,10 +1383,7 @@ fn tracer_err_return_data_out_of_bounds() {
         },
         |mut txs, accs| {
             txs[0].to(accs[0].address).from(accs[2].address);
-            txs[1]
-                .to(accs[1].address)
-                .from(accs[2].address)
-                .nonce(Word::one());
+            txs[1].to(accs[1].address).from(accs[2].address);
         },
         |block, _tx| block.number(0xcafeu64),
         LoggerConfig::enable_memory(),
@@ -1582,10 +1536,7 @@ fn tracer_err_write_protection(is_call: bool) {
         },
         |mut txs, accs| {
             txs[0].to(accs[0].address).from(accs[2].address);
-            txs[1]
-                .to(accs[1].address)
-                .from(accs[2].address)
-                .nonce(Word::one());
+            txs[1].to(accs[1].address).from(accs[2].address);
         },
         |block, _tx| block.number(0xcafeu64),
         LoggerConfig::enable_memory(),
@@ -1752,20 +1703,10 @@ fn create2_address() {
     };
 
     let mut code_b = Bytecode::default();
-    // pad code_creator to multiple of 32 bytes
-    let len = code_creator.to_vec().len();
-    let code_creator: Vec<u8> = code_creator
-        .to_vec()
-        .iter()
-        .cloned()
-        .chain(0u8..((32 - len % 32) as u8))
-        .collect();
-    for (index, word) in code_creator.chunks(32).enumerate() {
-        code_b.op_mstore(index * 32, Word::from_big_endian(word));
-    }
+    code_b.store_code_to_mem(&code_creator);
     let code_b_end = bytecode! {
         PUSH3(0x123456) // salt
-        PUSH1(len) // length
+        PUSH1(code_creator.codesize()) // length
         PUSH1(0x00) // offset
         PUSH1(0x00) // value
         CREATE2
@@ -1787,10 +1728,7 @@ fn create2_address() {
         },
         |mut txs, accs| {
             txs[0].to(accs[0].address).from(accs[2].address);
-            txs[1]
-                .to(accs[1].address)
-                .from(accs[2].address)
-                .nonce(Word::one());
+            txs[1].to(accs[1].address).from(accs[2].address);
         },
         |block, _tx| block.number(0xcafeu64),
         LoggerConfig::enable_memory(),
@@ -1848,17 +1786,8 @@ fn create_address() {
     };
 
     let mut code_b = Bytecode::default();
-    // pad code_creator to multiple of 32 bytes
-    let len = code_creator.to_vec().len();
-    let code_creator: Vec<u8> = code_creator
-        .to_vec()
-        .iter()
-        .cloned()
-        .chain(0u8..((32 - len % 32) as u8))
-        .collect();
-    for (index, word) in code_creator.chunks(32).enumerate() {
-        code_b.op_mstore(index * 32, Word::from_big_endian(word));
-    }
+    code_b.store_code_to_mem(&code_creator);
+    let len = code_creator.codesize();
     // We do CREATE 2 times to use a nonce != 0 in the second one.
     let code_b_end = bytecode! {
         PUSH1(len) // length
@@ -1888,10 +1817,7 @@ fn create_address() {
         },
         |mut txs, accs| {
             txs[0].to(accs[0].address).from(accs[2].address);
-            txs[1]
-                .to(accs[1].address)
-                .from(accs[2].address)
-                .nonce(Word::one());
+            txs[1].to(accs[1].address).from(accs[2].address);
         },
         |block, _tx| block.number(0xcafeu64),
         LoggerConfig::enable_memory(),
@@ -1924,7 +1850,7 @@ fn create_address() {
     builder.builder.sdb.set_account(
         &ADDR_B,
         Account {
-            nonce: Word::from(1),
+            nonce: 1,
             ..Account::zero()
         },
     );
@@ -1975,10 +1901,7 @@ fn test_gen_access_trace() {
         },
         |mut txs, accs| {
             txs[0].to(accs[0].address).from(accs[2].address);
-            txs[1]
-                .to(accs[1].address)
-                .from(accs[2].address)
-                .nonce(Word::one());
+            txs[1].to(accs[1].address).from(accs[2].address);
         },
         |block, _tx| block.number(0xcafeu64),
         LoggerConfig::enable_memory(),
@@ -2169,19 +2092,10 @@ fn test_gen_access_trace_create_push_call_stack() {
     };
 
     let mut code_b = Bytecode::default();
-    // pad code_creator to multiple of 32 bytes
-    let len = code_creator.to_vec().len();
-    let code_creator: Vec<u8> = code_creator
-        .to_vec()
-        .iter()
-        .cloned()
-        .chain(0u8..((32 - len % 32) as u8))
-        .collect();
-    for (index, word) in code_creator.chunks(32).enumerate() {
-        code_b.op_mstore(index * 32, Word::from_big_endian(word));
-    }
+    code_b.store_code_to_mem(&code_creator);
+
     let code_b_end = bytecode! {
-        PUSH1(len) // length
+        PUSH1(code_creator.codesize()) // length
         PUSH1(0x00) // offset
         PUSH1(0x00) // value
         CREATE
@@ -2200,10 +2114,7 @@ fn test_gen_access_trace_create_push_call_stack() {
         },
         |mut txs, accs| {
             txs[0].to(accs[0].address).from(accs[2].address);
-            txs[1]
-                .to(accs[1].address)
-                .from(accs[2].address)
-                .nonce(Word::one());
+            txs[1].to(accs[1].address).from(accs[2].address);
         },
         |block, _tx| block.number(0xcafeu64),
         LoggerConfig::enable_memory(),

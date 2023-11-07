@@ -13,36 +13,13 @@
 
 pub mod batched_is_zero;
 pub mod binary_number;
-pub mod evm_word;
 pub mod is_zero;
 pub mod less_than;
-pub mod less_than_v1;
-pub mod monotone;
 pub mod mul_add;
 pub mod util;
-pub mod less_than_copy;
-pub mod lessthan_or_equal;
-pub mod lessthan_or_equal_v1;
 
 use eth_types::Field;
-use halo2_proofs::{
-    circuit::{AssignedCell, Value},
-    plonk::Expression,
-};
-
-#[allow(dead_code)]
-/// An assigned cell in the circuit.
-#[derive(Clone, Debug)]
-pub struct Variable<T, F: Field> {
-    assig_cell: AssignedCell<F, F>,
-    value: Value<T>,
-}
-
-impl<T, F: Field> Variable<T, F> {
-    pub(crate) fn new(assig_cell: AssignedCell<F, F>, value: Value<T>) -> Self {
-        Self { assig_cell, value }
-    }
-}
+use halo2_proofs::plonk::Expression;
 
 /// Restrict an expression to be a boolean.
 pub fn bool_check<F: Field>(value: Expression<F>) -> Expression<F> {

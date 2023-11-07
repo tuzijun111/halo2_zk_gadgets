@@ -1,10 +1,11 @@
 use super::{
     param::{
         BLOCK_TABLE_LOOKUPS, BYTECODE_TABLE_LOOKUPS, COPY_TABLE_LOOKUPS, EXP_TABLE_LOOKUPS,
-        FIXED_TABLE_LOOKUPS, KECCAK_TABLE_LOOKUPS, N_BYTE_LOOKUPS, N_COPY_COLUMNS,
-        N_PHASE1_COLUMNS, RW_TABLE_LOOKUPS, TX_TABLE_LOOKUPS,
+        FIXED_TABLE_LOOKUPS, KECCAK_TABLE_LOOKUPS, N_COPY_COLUMNS, N_PHASE1_COLUMNS, N_U16_LOOKUPS,
+        N_U8_LOOKUPS, RW_TABLE_LOOKUPS, TX_TABLE_LOOKUPS,
     },
-    util::{instrumentation::Instrument, CachedRegion, CellManager, StoredExpression},
+    step::HasExecutionState,
+    util::{instrumentation::Instrument, CachedRegion, StoredExpression},
 };
 use crate::{
     evm_circuit::{
@@ -15,17 +16,20 @@ use crate::{
             constraint_builder::{
                 BaseConstraintBuilder, ConstrainBuilderCommon, EVMConstraintBuilder,
             },
-            rlc, CellType,
+            evaluate_expression, rlc,
         },
         witness::{Block, Call, ExecStep, Transaction},
     },
     table::LookupTable,
-    util::{query_expression, Challenges, Expr},
+    util::{
+        cell_manager::{CMFixedWidthStrategy, CellManager, CellType},
+        Challenges, Expr,
+    },
 };
+use bus_mapping::operation::Target;
 use eth_types::{evm_unimplemented, Field};
 use gadgets::util::not;
 use halo2_proofs::{
-    arithmetic::FieldExt,
     circuit::{Layouter, Region, Value},
     plonk::{
         Advice, Column, ConstraintSystem, Error, Expression, FirstPhase, Fixed, SecondPhase,
@@ -58,17 +62,24 @@ mod chainid;
 mod codecopy;
 mod codesize;
 mod comparator;
+mod create;
 mod dummy;
 mod dup;
 mod end_block;
 mod end_tx;
+mod error_code_store;
+mod error_invalid_creation_code;
 mod error_invalid_jump;
 mod error_invalid_opcode;
+mod error_oog_account_access;
 mod error_oog_call;
 mod error_oog_constant;
+mod error_oog_create;
+mod error_oog_dynamic_memory;
 mod error_oog_exp;
 mod error_oog_log;
 mod error_oog_memory_copy;
+mod error_oog_sha3;
 mod error_oog_sload_sstore;
 mod error_oog_static_memory;
 mod error_return_data_oo_bound;
@@ -110,14 +121,13 @@ mod sstore;
 mod stop;
 mod swap;
 
-use self::sha3::Sha3Gadget;
+use self::{block_ctx::BlockCtxGadget, sha3::Sha3Gadget};
 use add_sub::AddSubGadget;
 use addmod::AddModGadget;
 use address::AddressGadget;
 use balance::BalanceGadget;
 use begin_tx::BeginTxGadget;
 use bitwise::BitwiseGadget;
-use block_ctx::{BlockCtxU160Gadget, BlockCtxU256Gadget, BlockCtxU64Gadget};
 use blockhash::BlockHashGadget;
 use byte::ByteGadget;
 use calldatacopy::CallDataCopyGadget;
@@ -130,18 +140,26 @@ use chainid::ChainIdGadget;
 use codecopy::CodeCopyGadget;
 use codesize::CodesizeGadget;
 use comparator::ComparatorGadget;
+use create::CreateGadget;
 use dummy::DummyGadget;
 use dup::DupGadget;
 use end_block::EndBlockGadget;
 use end_tx::EndTxGadget;
+use error_code_store::ErrorCodeStoreGadget;
+use error_invalid_creation_code::ErrorInvalidCreationCodeGadget;
 use error_invalid_jump::ErrorInvalidJumpGadget;
 use error_invalid_opcode::ErrorInvalidOpcodeGadget;
+use error_oog_account_access::ErrorOOGAccountAccessGadget;
 use error_oog_call::ErrorOOGCallGadget;
 use error_oog_constant::ErrorOOGConstantGadget;
+use error_oog_create::ErrorOOGCreateGadget;
+use error_oog_dynamic_memory::ErrorOOGDynamicMemoryGadget;
 use error_oog_exp::ErrorOOGExpGadget;
 use error_oog_log::ErrorOOGLogGadget;
 use error_oog_memory_copy::ErrorOOGMemoryCopyGadget;
+use error_oog_sha3::ErrorOOGSha3Gadget;
 use error_oog_sload_sstore::ErrorOOGSloadSstoreGadget;
+use error_oog_static_memory::ErrorOOGStaticMemoryGadget;
 use error_return_data_oo_bound::ErrorReturnDataOutOfBoundGadget;
 use error_stack::ErrorStackGadget;
 use error_write_protection::ErrorWriteProtectionGadget;
@@ -179,7 +197,7 @@ use sstore::SstoreGadget;
 use stop::StopGadget;
 use swap::SwapGadget;
 
-pub(crate) trait ExecutionGadget<F: FieldExt> {
+pub(crate) trait ExecutionGadget<F: Field> {
     const NAME: &'static str;
 
     const EXECUTION_STATE: ExecutionState;
@@ -198,7 +216,7 @@ pub(crate) trait ExecutionGadget<F: FieldExt> {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ExecutionConfig<F> {
+pub struct ExecutionConfig<F> {
     // EVM Circuit selector, which enables all usable rows.  The rows where this selector is
     // disabled won't verify any constraint (they can be unused rows or rows with blinding
     // factors).
@@ -218,6 +236,7 @@ pub(crate) struct ExecutionConfig<F> {
     step: Step<F>,
     pub(crate) height_map: HashMap<ExecutionState, usize>,
     stored_expressions_map: HashMap<ExecutionState, Vec<StoredExpression<F>>>,
+    debug_expressions_map: HashMap<ExecutionState, Vec<(String, Expression<F>)>>,
     instrument: Instrument,
     // internal state gadgets
     begin_tx_gadget: Box<BeginTxGadget<F>>,
@@ -269,8 +288,8 @@ pub(crate) struct ExecutionConfig<F> {
     shl_shr_gadget: Box<ShlShrGadget<F>>,
     returndatasize_gadget: Box<ReturnDataSizeGadget<F>>,
     returndatacopy_gadget: Box<ReturnDataCopyGadget<F>>,
-    create_gadget: Box<DummyGadget<F, 3, 1, { ExecutionState::CREATE }>>,
-    create2_gadget: Box<DummyGadget<F, 4, 1, { ExecutionState::CREATE2 }>>,
+    create_gadget: Box<CreateGadget<F, false, { ExecutionState::CREATE }>>,
+    create2_gadget: Box<CreateGadget<F, true, { ExecutionState::CREATE2 }>>,
     selfdestruct_gadget: Box<DummyGadget<F, 1, 0, { ExecutionState::SELFDESTRUCT }>>,
     signed_comparator_gadget: Box<SignedComparatorGadget<F>>,
     signextend_gadget: Box<SignextendGadget<F>>,
@@ -279,37 +298,33 @@ pub(crate) struct ExecutionConfig<F> {
     stop_gadget: Box<StopGadget<F>>,
     swap_gadget: Box<SwapGadget<F>>,
     blockhash_gadget: Box<BlockHashGadget<F>>,
-    block_ctx_u64_gadget: Box<BlockCtxU64Gadget<F>>,
-    block_ctx_u160_gadget: Box<BlockCtxU160Gadget<F>>,
-    block_ctx_u256_gadget: Box<BlockCtxU256Gadget<F>>,
+    block_ctx_gadget: Box<BlockCtxGadget<F>>,
     // error gadgets
     error_oog_call: Box<ErrorOOGCallGadget<F>>,
     error_oog_constant: Box<ErrorOOGConstantGadget<F>>,
     error_oog_exp: Box<ErrorOOGExpGadget<F>>,
     error_oog_memory_copy: Box<ErrorOOGMemoryCopyGadget<F>>,
     error_oog_sload_sstore: Box<ErrorOOGSloadSstoreGadget<F>>,
-    error_oog_static_memory_gadget:
-        Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasStaticMemoryExpansion }>>,
+    error_oog_static_memory_gadget: Box<ErrorOOGStaticMemoryGadget<F>>,
     error_stack: Box<ErrorStackGadget<F>>,
     error_write_protection: Box<ErrorWriteProtectionGadget<F>>,
-    error_oog_dynamic_memory_gadget:
-        Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasDynamicMemoryExpansion }>>,
+    error_oog_dynamic_memory_gadget: Box<ErrorOOGDynamicMemoryGadget<F>>,
     error_oog_log: Box<ErrorOOGLogGadget<F>>,
-    error_oog_account_access:
-        Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasAccountAccess }>>,
-    error_oog_sha3: Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasSHA3 }>>,
+    error_oog_sha3: Box<ErrorOOGSha3Gadget<F>>,
+    error_oog_account_access: Box<ErrorOOGAccountAccessGadget<F>>,
     error_oog_ext_codecopy: Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasEXTCODECOPY }>>,
-    error_oog_create2: Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasCREATE2 }>>,
+    error_oog_create: Box<ErrorOOGCreateGadget<F>>,
     error_oog_self_destruct:
         Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasSELFDESTRUCT }>>,
-    error_oog_code_store: Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorOutOfGasCodeStore }>>,
+    error_oog_code_store: Box<ErrorCodeStoreGadget<F>>,
     error_invalid_jump: Box<ErrorInvalidJumpGadget<F>>,
     error_invalid_opcode: Box<ErrorInvalidOpcodeGadget<F>>,
+    #[allow(dead_code, reason = "under active development")]
     error_depth: Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorDepth }>>,
+    #[allow(dead_code, reason = "under active development")]
     error_contract_address_collision:
         Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorContractAddressCollision }>>,
-    error_invalid_creation_code:
-        Box<DummyGadget<F, 0, 0, { ExecutionState::ErrorInvalidCreationCode }>>,
+    error_invalid_creation_code: Box<ErrorInvalidCreationCodeGadget<F>>,
     error_return_data_out_of_bound: Box<ErrorReturnDataOutOfBoundGadget<F>>,
 }
 
@@ -320,7 +335,8 @@ impl<F: Field> ExecutionConfig<F> {
         meta: &mut ConstraintSystem<F>,
         challenges: Challenges<Expression<F>>,
         fixed_table: &dyn LookupTable<F>,
-        byte_table: &dyn LookupTable<F>,
+        u8_table: &dyn LookupTable<F>,
+        u16_table: &dyn LookupTable<F>,
         tx_table: &dyn LookupTable<F>,
         rw_table: &dyn LookupTable<F>,
         bytecode_table: &dyn LookupTable<F>,
@@ -355,7 +371,7 @@ impl<F: Field> ExecutionConfig<F> {
             .try_into()
             .unwrap();
 
-        let step_curr = Step::new(meta, advices, 0, false);
+        let step_curr = Step::new(meta, advices, 0);
         let mut height_map = HashMap::new();
 
         meta.create_gate("Constrain execution state", |meta| {
@@ -448,6 +464,7 @@ impl<F: Field> ExecutionConfig<F> {
         });
 
         let mut stored_expressions_map = HashMap::new();
+        let mut debug_expressions_map = HashMap::new();
 
         macro_rules! configure_gadget {
             () => {
@@ -469,6 +486,7 @@ impl<F: Field> ExecutionConfig<F> {
                         &step_curr,
                         &mut height_map,
                         &mut stored_expressions_map,
+                        &mut debug_expressions_map,
                         &mut instrument,
                     ))
                 })()
@@ -546,9 +564,7 @@ impl<F: Field> ExecutionConfig<F> {
             sstore_gadget: configure_gadget!(),
             stop_gadget: configure_gadget!(),
             swap_gadget: configure_gadget!(),
-            block_ctx_u64_gadget: configure_gadget!(),
-            block_ctx_u160_gadget: configure_gadget!(),
-            block_ctx_u256_gadget: configure_gadget!(),
+            block_ctx_gadget: configure_gadget!(),
             // error gadgets
             error_oog_constant: configure_gadget!(),
             error_oog_static_memory_gadget: configure_gadget!(),
@@ -562,7 +578,7 @@ impl<F: Field> ExecutionConfig<F> {
             error_oog_sha3: configure_gadget!(),
             error_oog_ext_codecopy: configure_gadget!(),
             error_oog_exp: configure_gadget!(),
-            error_oog_create2: configure_gadget!(),
+            error_oog_create: configure_gadget!(),
             error_oog_self_destruct: configure_gadget!(),
             error_oog_code_store: configure_gadget!(),
             error_invalid_jump: configure_gadget!(),
@@ -576,13 +592,15 @@ impl<F: Field> ExecutionConfig<F> {
             step: step_curr,
             height_map,
             stored_expressions_map,
+            debug_expressions_map,
             instrument,
         };
 
         Self::configure_lookup(
             meta,
             fixed_table,
-            byte_table,
+            u8_table,
+            u16_table,
             tx_table,
             rw_table,
             bytecode_table,
@@ -596,7 +614,7 @@ impl<F: Field> ExecutionConfig<F> {
         config
     }
 
-    pub(crate) fn instrument(&self) -> &Instrument {
+    pub fn instrument(&self) -> &Instrument {
         &self.instrument
     }
 
@@ -613,26 +631,29 @@ impl<F: Field> ExecutionConfig<F> {
         step_curr: &Step<F>,
         height_map: &mut HashMap<ExecutionState, usize>,
         stored_expressions_map: &mut HashMap<ExecutionState, Vec<StoredExpression<F>>>,
+        debug_expressions_map: &mut HashMap<ExecutionState, Vec<(String, Expression<F>)>>,
         instrument: &mut Instrument,
     ) -> G {
         // Configure the gadget with the max height first so we can find out the actual
         // height
         let height = {
-            let dummy_step_next = Step::new(meta, advices, MAX_STEP_HEIGHT, true);
+            let dummy_step_next = Step::new(meta, advices, MAX_STEP_HEIGHT);
             let mut cb = EVMConstraintBuilder::new(
+                meta,
                 step_curr.clone(),
                 dummy_step_next,
                 challenges,
                 G::EXECUTION_STATE,
             );
             G::configure(&mut cb);
-            let (_, _, height) = cb.build();
+            let (_, _, height, _) = cb.build();
             height
         };
 
         // Now actually configure the gadget with the correct minimal height
-        let step_next = &Step::new(meta, advices, height, true);
+        let step_next = &Step::new(meta, advices, height);
         let mut cb = EVMConstraintBuilder::new(
+            meta,
             step_curr.clone(),
             step_next.clone(),
             challenges,
@@ -642,7 +663,6 @@ impl<F: Field> ExecutionConfig<F> {
         let gadget = G::configure(&mut cb);
 
         Self::configure_gadget_impl(
-            meta,
             q_usable,
             q_step,
             num_rows_until_next_step,
@@ -652,6 +672,7 @@ impl<F: Field> ExecutionConfig<F> {
             step_next,
             height_map,
             stored_expressions_map,
+            debug_expressions_map,
             instrument,
             G::NAME,
             G::EXECUTION_STATE,
@@ -664,7 +685,6 @@ impl<F: Field> ExecutionConfig<F> {
 
     #[allow(clippy::too_many_arguments)]
     fn configure_gadget_impl(
-        meta: &mut ConstraintSystem<F>,
         q_usable: Selector,
         q_step: Column<Advice>,
         num_rows_until_next_step: Column<Advice>,
@@ -674,6 +694,7 @@ impl<F: Field> ExecutionConfig<F> {
         step_next: &Step<F>,
         height_map: &mut HashMap<ExecutionState, usize>,
         stored_expressions_map: &mut HashMap<ExecutionState, Vec<StoredExpression<F>>>,
+        debug_expressions_map: &mut HashMap<ExecutionState, Vec<(String, Expression<F>)>>,
         instrument: &mut Instrument,
         name: &'static str,
         execution_state: ExecutionState,
@@ -681,9 +702,8 @@ impl<F: Field> ExecutionConfig<F> {
         mut cb: EVMConstraintBuilder<F>,
     ) {
         // Enforce the step height for this opcode
-        let num_rows_until_next_step_next = query_expression(meta, |meta| {
-            meta.query_advice(num_rows_until_next_step, Rotation::next())
-        });
+        let num_rows_until_next_step_next = cb
+            .query_expression(|meta| meta.query_advice(num_rows_until_next_step, Rotation::next()));
         cb.require_equal(
             "num_rows_until_next_step_next := height - 1",
             num_rows_until_next_step_next,
@@ -692,7 +712,8 @@ impl<F: Field> ExecutionConfig<F> {
 
         instrument.on_gadget_built(execution_state, &cb);
 
-        let (constraints, stored_expressions, _) = cb.build();
+        let debug_expressions = cb.debug_expressions.clone();
+        let (constraints, stored_expressions, _, meta) = cb.build();
         debug_assert!(
             !height_map.contains_key(&execution_state),
             "execution state already configured"
@@ -704,6 +725,7 @@ impl<F: Field> ExecutionConfig<F> {
             "execution state already configured"
         );
         stored_expressions_map.insert(execution_state, stored_expressions);
+        debug_expressions_map.insert(execution_state, debug_expressions);
 
         // Enforce the logic for this opcode
         let sel_step: &dyn Fn(&mut VirtualCells<F>) -> Expression<F> =
@@ -798,7 +820,8 @@ impl<F: Field> ExecutionConfig<F> {
     fn configure_lookup(
         meta: &mut ConstraintSystem<F>,
         fixed_table: &dyn LookupTable<F>,
-        byte_table: &dyn LookupTable<F>,
+        u8_table: &dyn LookupTable<F>,
+        u16_table: &dyn LookupTable<F>,
         tx_table: &dyn LookupTable<F>,
         rw_table: &dyn LookupTable<F>,
         bytecode_table: &dyn LookupTable<F>,
@@ -807,14 +830,17 @@ impl<F: Field> ExecutionConfig<F> {
         keccak_table: &dyn LookupTable<F>,
         exp_table: &dyn LookupTable<F>,
         challenges: &Challenges<Expression<F>>,
-        cell_manager: &CellManager<F>,
+        cell_manager: &CellManager<CMFixedWidthStrategy>,
     ) {
         for column in cell_manager.columns().iter() {
             if let CellType::Lookup(table) = column.cell_type {
                 let name = format!("{:?}", table);
+                let column_expr = column.expr(meta);
                 meta.lookup_any(Box::leak(name.into_boxed_str()), |meta| {
                     let table_expressions = match table {
                         Table::Fixed => fixed_table,
+                        Table::U8 => u8_table,
+                        Table::U16 => u16_table,
                         Table::Tx => tx_table,
                         Table::Rw => rw_table,
                         Table::Bytecode => bytecode_table,
@@ -825,17 +851,9 @@ impl<F: Field> ExecutionConfig<F> {
                     }
                     .table_exprs(meta);
                     vec![(
-                        column.expr(),
+                        column_expr,
                         rlc::expr(&table_expressions, challenges.lookup_input()),
                     )]
-                });
-            }
-        }
-        for column in cell_manager.columns().iter() {
-            if let CellType::LookupByte = column.cell_type {
-                meta.lookup_any("Byte lookup", |meta| {
-                    let byte_table_expression = byte_table.table_exprs(meta)[0].clone();
-                    vec![(column.expr(), byte_table_expression)]
                 });
             }
         }
@@ -856,10 +874,10 @@ impl<F: Field> ExecutionConfig<F> {
                 || "step selector",
                 self.q_step,
                 offset,
-                || Value::known(if idx == 0 { F::one() } else { F::zero() }),
+                || Value::known(if idx == 0 { F::ONE } else { F::ZERO }),
             )?;
             let value = if idx == 0 {
-                F::zero()
+                F::ZERO
             } else {
                 F::from((height - idx) as u64)
             };
@@ -873,7 +891,7 @@ impl<F: Field> ExecutionConfig<F> {
                 || "step height inv",
                 self.num_rows_inv,
                 offset,
-                || Value::known(value.invert().unwrap_or(F::zero())),
+                || Value::known(value.invert().unwrap_or(F::ZERO)),
             )?;
         }
         Ok(())
@@ -888,6 +906,8 @@ impl<F: Field> ExecutionConfig<F> {
         block: &Block<F>,
         challenges: &Challenges<Value<F>>,
     ) -> Result<(), Error> {
+        // Track number of calls to `layouter.assign_region` as layouter assignment passes.
+        let mut assign_pass = 0;
         layouter.assign_region(
             || "Execution step",
             |mut region| {
@@ -902,7 +922,7 @@ impl<F: Field> ExecutionConfig<F> {
                 let last_call = block
                     .txs
                     .last()
-                    .map(|tx| tx.calls[0].clone())
+                    .map(|tx| tx.calls()[0].clone())
                     .unwrap_or_else(Call::default);
                 let end_block_not_last = &block.end_block_not_last;
                 let end_block_last = &block.end_block_last;
@@ -911,9 +931,9 @@ impl<F: Field> ExecutionConfig<F> {
                     .txs
                     .iter()
                     .flat_map(|tx| {
-                        tx.steps
+                        tx.steps()
                             .iter()
-                            .map(move |step| (tx, &tx.calls[step.call_index], step))
+                            .map(move |step| (tx, &tx.calls()[step.call_index], step))
                     })
                     .chain(std::iter::once((&dummy_tx, &last_call, end_block_not_last)))
                     .peekable();
@@ -928,7 +948,7 @@ impl<F: Field> ExecutionConfig<F> {
                     if next.is_none() {
                         break;
                     }
-                    let height = step.execution_state.get_step_height();
+                    let height = step.execution_state().get_step_height();
 
                     // Assign the step witness
                     self.assign_exec_step(
@@ -941,6 +961,7 @@ impl<F: Field> ExecutionConfig<F> {
                         height,
                         next.copied(),
                         challenges,
+                        assign_pass,
                     )?;
 
                     // q_step logic
@@ -977,6 +998,7 @@ impl<F: Field> ExecutionConfig<F> {
                         end_block_not_last,
                         height,
                         challenges,
+                        assign_pass,
                     )?;
 
                     for row_idx in offset..last_row {
@@ -999,6 +1021,7 @@ impl<F: Field> ExecutionConfig<F> {
                     height,
                     None,
                     challenges,
+                    assign_pass,
                 )?;
                 self.assign_q_step(&mut region, offset, height)?;
                 // enable q_step_last
@@ -1011,15 +1034,16 @@ impl<F: Field> ExecutionConfig<F> {
                     || "step height",
                     self.num_rows_until_next_step,
                     offset,
-                    || Value::known(F::zero()),
+                    || Value::known(F::ZERO),
                 )?;
                 region.assign_advice(
                     || "step height inv",
                     self.q_step,
                     offset,
-                    || Value::known(F::zero()),
+                    || Value::known(F::ZERO),
                 )?;
 
+                assign_pass += 1;
                 Ok(())
             },
         )
@@ -1037,7 +1061,8 @@ impl<F: Field> ExecutionConfig<F> {
             ("EVM_lookup_exp", EXP_TABLE_LOOKUPS),
             ("EVM_adv_phase2", N_PHASE2_COLUMNS),
             ("EVM_copy", N_COPY_COLUMNS),
-            ("EVM_lookup_byte", N_BYTE_LOOKUPS),
+            ("EVM_lookup_u8", N_U8_LOOKUPS),
+            ("EVM_lookup_u16", N_U16_LOOKUPS),
             ("EVM_adv_phase1", N_PHASE1_COLUMNS),
         ];
         let mut group_index = 0;
@@ -1070,13 +1095,14 @@ impl<F: Field> ExecutionConfig<F> {
         step: &ExecStep,
         height: usize,
         challenges: &Challenges<Value<F>>,
+        assign_pass: usize,
     ) -> Result<(), Error> {
         if offset_end <= offset_begin {
             return Ok(());
         }
         assert_eq!(height, 1);
-        assert!(step.rw_indices.is_empty());
-        assert!(matches!(step.execution_state, ExecutionState::EndBlock));
+        assert!(step.rw_indices_len() == 0);
+        assert!(matches!(step.execution_state(), ExecutionState::EndBlock));
 
         // Disable access to next step deliberately for "repeatable" step
         let region = &mut CachedRegion::<'_, '_, F>::new(
@@ -1086,10 +1112,19 @@ impl<F: Field> ExecutionConfig<F> {
             1,
             offset_begin,
         );
-        self.assign_exec_step_int(region, offset_begin, block, transaction, call, step)?;
+        self.assign_exec_step_int(
+            region,
+            offset_begin,
+            block,
+            transaction,
+            call,
+            step,
+            false,
+            assign_pass,
+        )?;
 
         region.replicate_assignment_for_range(
-            || format!("repeat {:?} rows", step.execution_state),
+            || format!("repeat {:?} rows", step.execution_state()),
             offset_begin + 1,
             offset_end,
         )?;
@@ -1109,12 +1144,13 @@ impl<F: Field> ExecutionConfig<F> {
         height: usize,
         next: Option<(&Transaction, &Call, &ExecStep)>,
         challenges: &Challenges<Value<F>>,
+        assign_pass: usize,
     ) -> Result<(), Error> {
-        if !matches!(step.execution_state, ExecutionState::EndBlock) {
+        if !matches!(step.execution_state(), ExecutionState::EndBlock) {
             log::trace!(
                 "assign_exec_step offset: {} state {:?} step: {:?} call: {:?}",
                 offset,
-                step.execution_state,
+                step.execution_state(),
                 step,
                 call
             );
@@ -1142,12 +1178,24 @@ impl<F: Field> ExecutionConfig<F> {
                 transaction_next,
                 call_next,
                 step_next,
+                true,
+                assign_pass,
             )?;
         }
 
-        self.assign_exec_step_int(region, offset, block, transaction, call, step)
+        self.assign_exec_step_int(
+            region,
+            offset,
+            block,
+            transaction,
+            call,
+            step,
+            false,
+            assign_pass,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assign_exec_step_int(
         &self,
         region: &mut CachedRegion<'_, '_, F>,
@@ -1156,6 +1204,12 @@ impl<F: Field> ExecutionConfig<F> {
         transaction: &Transaction,
         call: &Call,
         step: &ExecStep,
+        // Set to true when we're assigning the next step before the current step to have
+        // next step assignments for evaluation of the stored expressions in current step that
+        // depend on the next step.
+        is_next: bool,
+        // Layouter assignment pass
+        assign_pass: usize,
     ) -> Result<(), Error> {
         self.step
             .assign_exec_step(region, offset, block, call, step)?;
@@ -1166,7 +1220,7 @@ impl<F: Field> ExecutionConfig<F> {
             };
         }
 
-        match step.execution_state {
+        match step.execution_state() {
             // internal states
             ExecutionState::BeginTx => assign_exec_step!(self.begin_tx_gadget),
             ExecutionState::EndTx => assign_exec_step!(self.end_tx_gadget),
@@ -1214,9 +1268,7 @@ impl<F: Field> ExecutionConfig<F> {
             ExecutionState::SAR => assign_exec_step!(self.sar_gadget),
             ExecutionState::SCMP => assign_exec_step!(self.signed_comparator_gadget),
             ExecutionState::SDIV_SMOD => assign_exec_step!(self.sdiv_smod_gadget),
-            ExecutionState::BLOCKCTXU64 => assign_exec_step!(self.block_ctx_u64_gadget),
-            ExecutionState::BLOCKCTXU160 => assign_exec_step!(self.block_ctx_u160_gadget),
-            ExecutionState::BLOCKCTXU256 => assign_exec_step!(self.block_ctx_u256_gadget),
+            ExecutionState::BLOCKCTX => assign_exec_step!(self.block_ctx_gadget),
             ExecutionState::BLOCKHASH => assign_exec_step!(self.blockhash_gadget),
             ExecutionState::SELFBALANCE => assign_exec_step!(self.selfbalance_gadget),
             // dummy gadgets
@@ -1266,23 +1318,20 @@ impl<F: Field> ExecutionConfig<F> {
             ExecutionState::ErrorOutOfGasEXP => {
                 assign_exec_step!(self.error_oog_exp)
             }
-            ExecutionState::ErrorOutOfGasCREATE2 => {
-                assign_exec_step!(self.error_oog_create2)
+            ExecutionState::ErrorOutOfGasCREATE => {
+                assign_exec_step!(self.error_oog_create)
             }
             ExecutionState::ErrorOutOfGasSELFDESTRUCT => {
                 assign_exec_step!(self.error_oog_self_destruct)
             }
 
-            ExecutionState::ErrorOutOfGasCodeStore => {
+            ExecutionState::ErrorCodeStore => {
                 assign_exec_step!(self.error_oog_code_store)
             }
             ExecutionState::ErrorStack => {
                 assign_exec_step!(self.error_stack)
             }
 
-            ExecutionState::ErrorInsufficientBalance => {
-                assign_exec_step!(self.call_op_gadget)
-            }
             ExecutionState::ErrorInvalidJump => {
                 assign_exec_step!(self.error_invalid_jump)
             }
@@ -1292,12 +1341,6 @@ impl<F: Field> ExecutionConfig<F> {
             ExecutionState::ErrorWriteProtection => {
                 assign_exec_step!(self.error_write_protection)
             }
-            ExecutionState::ErrorDepth => {
-                assign_exec_step!(self.error_depth)
-            }
-            ExecutionState::ErrorContractAddressCollision => {
-                assign_exec_step!(self.error_contract_address_collision)
-            }
             ExecutionState::ErrorInvalidCreationCode => {
                 assign_exec_step!(self.error_invalid_creation_code)
             }
@@ -1305,27 +1348,39 @@ impl<F: Field> ExecutionConfig<F> {
                 assign_exec_step!(self.error_return_data_out_of_bound)
             }
 
-            _ => evm_unimplemented!("unimplemented ExecutionState: {:?}", step.execution_state),
+            unimpl_state => evm_unimplemented!("unimplemented ExecutionState: {:?}", unimpl_state),
         }
 
         // Fill in the witness values for stored expressions
         let assigned_stored_expressions = self.assign_stored_expressions(region, offset, step)?;
+        // Both `SimpleFloorPlanner` and `V1` do two passes; we only enter here once (on the second
+        // pass).
+        if !is_next && assign_pass == 1 {
+            // We only want to print at the latest possible Phase.  Currently halo2 implements 3
+            // phases.  The `lookup_input` randomness is calculated after SecondPhase, so we print
+            // the debug expressions only once when we're at third phase, when `lookup_input` has
+            // a `Value::known`.  This gets called for every `synthesize` call that the Layouter
+            // does.
+            region.challenges().lookup_input().assert_if_known(|_| {
+                self.print_debug_expressions(region, offset, step);
+                true
+            });
 
-        // enable with `RUST_LOG=debug`
-        if log::log_enabled!(log::Level::Debug) {
-            let is_padding_step = matches!(step.execution_state, ExecutionState::EndBlock)
-                && step.rw_indices.is_empty();
-            if !is_padding_step {
-                // expensive function call
-                Self::check_rw_lookup(
-                    &assigned_stored_expressions,
-                    step,
-                    block,
-                    region.challenges(),
-                );
+            // enable with `RUST_LOG=debug`
+            if log::log_enabled!(log::Level::Debug) {
+                let is_padding_step = matches!(step.execution_state(), ExecutionState::EndBlock)
+                    && step.rw_indices_len() == 0;
+                if !is_padding_step {
+                    // expensive function call
+                    Self::check_rw_lookup(
+                        &assigned_stored_expressions,
+                        step,
+                        block,
+                        region.challenges(),
+                    );
+                }
             }
         }
-        //}
         Ok(())
     }
 
@@ -1338,8 +1393,8 @@ impl<F: Field> ExecutionConfig<F> {
         let mut assigned_stored_expressions = Vec::new();
         for stored_expression in self
             .stored_expressions_map
-            .get(&step.execution_state)
-            .unwrap_or_else(|| panic!("Execution state unknown: {:?}", step.execution_state))
+            .get(&step.execution_state())
+            .unwrap_or_else(|| panic!("Execution state unknown: {:?}", step.execution_state()))
         {
             let assigned = stored_expression.assign(region, offset)?;
             assigned.map(|v| {
@@ -1350,38 +1405,76 @@ impl<F: Field> ExecutionConfig<F> {
         Ok(assigned_stored_expressions)
     }
 
+    fn print_debug_expressions(
+        &self,
+        region: &mut CachedRegion<'_, '_, F>,
+        offset: usize,
+        step: &ExecStep,
+    ) {
+        for (name, expression) in self
+            .debug_expressions_map
+            .get(&step.execution_state())
+            .unwrap_or_else(|| panic!("Execution state unknown: {:?}", step.execution_state()))
+        {
+            let value = evaluate_expression(expression, region, offset);
+            let mut value_string = "unknown".to_string();
+            value.assert_if_known(|f| {
+                value_string = format!("{:?}", f);
+                true
+            });
+            println!(
+                "Debug expression \"{}\"={} [offset={}, step={:?}, expr={:?}]",
+                name, value_string, offset, step.exec_state, expression
+            );
+        }
+    }
+
     fn check_rw_lookup(
         assigned_stored_expressions: &[(String, F)],
         step: &ExecStep,
         block: &Block<F>,
         challenges: &Challenges<Value<F>>,
     ) {
-        let mut evm_randomness = F::zero();
-        challenges.evm_word().map(|v| evm_randomness = v);
-        let mut lookup_randomness = F::zero();
+        let mut lookup_randomness = F::ZERO;
         challenges.lookup_input().map(|v| lookup_randomness = v);
-        if evm_randomness.is_zero_vartime() || lookup_randomness.is_zero_vartime() {
+        if lookup_randomness.is_zero_vartime() {
             // challenges not ready
             return;
         }
+
+        let mut copy_lookup_count = 0;
         let mut assigned_rw_values = Vec::new();
         for (name, v) in assigned_stored_expressions {
-            if name.starts_with("rw lookup ")
+            // If any `copy lookup` which dst_tag or src_tag is Memory in opcode execution,
+            // block.get_rws() contains memory operations but
+            // assigned_stored_expressions only has a single `copy lookup` expression without
+            // any rw memory lookup.
+            // So, we include `copy lookup` in assigned_rw_values as well, then we could verify
+            // those memory operations later.
+            if (name.starts_with("rw lookup ") || name.starts_with("copy lookup"))
                 && !v.is_zero_vartime()
                 && !assigned_rw_values.contains(&(name.clone(), *v))
             {
                 assigned_rw_values.push((name.clone(), *v));
+
+                if name.starts_with("copy lookup") {
+                    copy_lookup_count += 1;
+                }
             }
         }
 
-        let rlc_assignments: BTreeSet<_> = step
-            .rw_indices
-            .iter()
-            .map(|rw_idx| block.rws[*rw_idx])
-            .map(|rw| {
-                rw.table_assignment_aux(evm_randomness)
-                    .rlc(lookup_randomness)
-            })
+        // TODO: We should find a better way to avoid this kind of special case.
+        // #1489 is the issue for this refactor.
+        if copy_lookup_count > 1 {
+            log::warn!("The number of copy events is more than 1, it's not supported by current design. Stop checking this step: {:?}",
+                step
+            );
+            return;
+        }
+
+        let rlc_assignments: BTreeSet<_> = (0..step.rw_indices_len())
+            .map(|index| block.get_rws(step, index))
+            .map(|rw| rw.table_assignment().unwrap().rlc(lookup_randomness))
             .fold(BTreeSet::<F>::new(), |mut set, value| {
                 set.insert(value);
                 set
@@ -1390,23 +1483,39 @@ impl<F: Field> ExecutionConfig<F> {
         // Check that every rw_lookup assigned from the execution steps in the EVM
         // Circuit is in the set of rw operations generated by the step.
         for (name, value) in assigned_rw_values.iter() {
+            if name.starts_with("copy lookup") {
+                continue;
+            }
             if !rlc_assignments.contains(value) {
                 log::error!("rw lookup error: name: {}, step: {:?}", *name, step);
             }
         }
+
+        // if copy_rw_counter_delta is zero, ignore `copy lookup` event.
+        if step.copy_rw_counter_delta == 0 && copy_lookup_count > 0 {
+            copy_lookup_count = 0;
+        }
+
         // Check that the number of rw operations generated from the bus-mapping
         // correspond to the number of assigned rw lookups by the EVM Circuit
-        // plus the number of rw lookups done by the copy circuit.
-        if step.rw_indices.len() != assigned_rw_values.len() + step.copy_rw_counter_delta as usize {
+        // plus the number of rw lookups done by the copy circuit
+        // minus the number of copy lookup event.
+        if step.rw_indices_len()
+            != assigned_rw_values.len() + step.copy_rw_counter_delta as usize - copy_lookup_count
+        {
             log::error!(
-                "step.rw_indices.len: {} != assigned_rw_values.len: {} + step.copy_rw_counter_delta: {} in step: {:?}", 
-                step.rw_indices.len(),
+                "step.rw_indices.len: {} != assigned_rw_values.len: {} + step.copy_rw_counter_delta: {} - copy_lookup_count: {} in step: {:?}",
+                step.rw_indices_len(),
                 assigned_rw_values.len(),
                 step.copy_rw_counter_delta,
+                copy_lookup_count,
                 step
             );
         }
+
         let mut rev_count = 0;
+        let mut offset = 0;
+        let mut copy_lookup_processed = false;
         for (idx, assigned_rw_value) in assigned_rw_values.iter().enumerate() {
             let is_rev = if assigned_rw_value.0.contains(" with reversion") {
                 rev_count += 1;
@@ -1420,27 +1529,48 @@ impl<F: Field> ExecutionConfig<F> {
                 rev_count,
                 step.reversible_write_counter_delta
             );
+
             // In the EVM Circuit, reversion rw lookups are assigned after their
             // corresponding rw lookup, but in the bus-mapping they are
             // generated at the end of the step.
             let idx = if is_rev {
-                step.rw_indices.len() - rev_count
+                step.rw_indices_len() - rev_count
             } else {
-                idx - rev_count
+                idx - rev_count + offset - copy_lookup_processed as usize
             };
-            let rw_idx = step.rw_indices[idx];
-            let rw = block.rws[rw_idx];
-            let table_assignments = rw.table_assignment_aux(evm_randomness);
-            let rlc = table_assignments.rlc(lookup_randomness);
+
+            // If assigned_rw_value is a `copy lookup` event, the following
+            // `step.copy_rw_counter_delta` rw lookups must be memory operations.
+            if assigned_rw_value.0.starts_with("copy lookup") {
+                for i in 0..step.copy_rw_counter_delta as usize {
+                    let index = idx + i;
+                    let rw = block.get_rws(step, index);
+                    if rw.tag() != Target::Memory {
+                        log::error!(
+                                "incorrect rw memory witness from copy lookup.\n lookup name: \"{}\"\n {}th rw of step {:?}, rw: {:?}",
+                                assigned_rw_value.0,
+                                index,
+                                step.execution_state(),
+                                rw);
+                    }
+                }
+
+                offset = step.copy_rw_counter_delta as usize;
+                copy_lookup_processed = true;
+                continue;
+            }
+
+            let rw = block.get_rws(step, idx);
+            let table_assignments = rw.table_assignment();
+            let rlc = table_assignments.unwrap().rlc(lookup_randomness);
             if rlc != assigned_rw_value.1 {
                 log::error!(
-                    "incorrect rw witness. lookup input name: \"{}\"\nassigned={:?}\nrlc     ={:?}\nrw index: {:?}, {}th rw of step {:?}, rw: {:?}",
+                    "incorrect rw witness. lookup input name: \"{}\"\nassigned={:?}\nrlc     ={:?}\n{}th rw of step {:?}, rw: {:?}",
                     assigned_rw_value.0,
                     assigned_rw_value.1,
                     rlc,
-                    rw_idx,
                     idx,
-                    step.execution_state,
+                    step.execution_state(),
                     rw);
             }
         }

@@ -31,9 +31,11 @@ impl<const N_ARGS: usize> Opcode for CallOpcode<N_ARGS> {
         let geth_step = &geth_steps[0];
         let mut exec_step = state.new_step(geth_step)?;
 
-        let args_offset = geth_step.stack.nth_last(N_ARGS - 4)?.as_usize();
+        // In offset and length are truncated to Uint64 for call opcodes as:
+        // <https://github.com/ethereum/go-ethereum/blob/84c3799e21d61d677965715fe09f8209660b4009/core/vm/instructions.go#L672>
+        let args_offset = geth_step.stack.nth_last(N_ARGS - 4)?.low_u64() as usize;
         let args_length = geth_step.stack.nth_last(N_ARGS - 3)?.as_usize();
-        let ret_offset = geth_step.stack.nth_last(N_ARGS - 2)?.as_usize();
+        let ret_offset = geth_step.stack.nth_last(N_ARGS - 2)?.low_u64() as usize;
         let ret_length = geth_step.stack.nth_last(N_ARGS - 1)?.as_usize();
 
         // we need to keep the memory until parse_call complete
@@ -80,7 +82,7 @@ impl<const N_ARGS: usize> Opcode for CallOpcode<N_ARGS> {
             ]);
         }
         for (field, value) in field_values {
-            state.call_context_read(&mut exec_step, current_call.call_id, field, value);
+            state.call_context_read(&mut exec_step, current_call.call_id, field, value)?;
         }
 
         for i in 0..N_ARGS {
@@ -98,7 +100,8 @@ impl<const N_ARGS: usize> Opcode for CallOpcode<N_ARGS> {
         )?;
 
         let callee_code_hash = call.code_hash;
-        let callee_exists = !state.sdb.get_account(&callee_address).1.is_empty();
+        let callee = state.sdb.get_account(&callee_address).1.clone();
+        let callee_exists = !callee.is_empty();
 
         let (callee_code_hash_word, is_empty_code_hash) = if callee_exists {
             (
@@ -113,7 +116,7 @@ impl<const N_ARGS: usize> Opcode for CallOpcode<N_ARGS> {
             callee_address,
             AccountField::CodeHash,
             callee_code_hash_word,
-        );
+        )?;
 
         let is_warm = state.sdb.check_account_in_access_list(&callee_address);
         state.push_op_reversible(
@@ -136,18 +139,20 @@ impl<const N_ARGS: usize> Opcode for CallOpcode<N_ARGS> {
                 (call.is_persistent as u64).into(),
             ),
         ] {
-            state.call_context_write(&mut exec_step, call.clone().call_id, field, value);
+            state.call_context_write(&mut exec_step, call.clone().call_id, field, value)?;
         }
 
         let (found, sender_account) = state.sdb.get_account(&call.caller_address);
         debug_assert!(found);
 
         let caller_balance = sender_account.balance;
+
         let is_call_or_callcode = call.kind == CallKind::Call || call.kind == CallKind::CallCode;
+        let is_sufficient = caller_balance >= call.value;
+        let is_valid_depth = geth_step.depth < 1025;
 
         // Precheck is OK when depth is in range and caller balance is sufficient
-        let is_precheck_ok =
-            geth_step.depth < 1025 && (!is_call_or_callcode || caller_balance >= call.value);
+        let is_precheck_ok = is_valid_depth && (is_sufficient || !is_call_or_callcode);
 
         log::debug!(
             "is_precheck_ok: {}, call type: {:?}, sender_account: {:?} ",
@@ -165,20 +170,23 @@ impl<const N_ARGS: usize> Opcode for CallOpcode<N_ARGS> {
             call.caller_address,
             AccountField::Balance,
             caller_balance,
-        );
+        )?;
 
         let code_address = call.code_address();
         let is_precompile = code_address
             .map(|ref addr| is_precompiled(addr))
             .unwrap_or(false);
-        // TODO: What about transfer for CALLCODE?
-        // Transfer value only for CALL opcode, is_precheck_ok = true.
-        if call.kind == CallKind::Call && is_precheck_ok {
+        // CALLCODE does not need to do real transfer
+        // Transfer value only when all these conditions met:
+        // - The opcode is CALL
+        // - The precheck passed
+        // - The value to send is not zero
+        if call.kind == CallKind::Call && is_precheck_ok && !call.value.is_zero() {
             state.transfer(
                 &mut exec_step,
                 call.caller_address,
                 call.address,
-                callee_exists || is_precompile,
+                callee_exists,
                 false,
                 call.value,
             )?;
@@ -201,13 +209,13 @@ impl<const N_ARGS: usize> Opcode for CallOpcode<N_ARGS> {
         let memory_expansion_gas_cost =
             memory_expansion_gas_cost(curr_memory_word_size, next_memory_word_size);
         let gas_cost = if is_warm {
-            GasCost::WARM_ACCESS.as_u64()
+            GasCost::WARM_ACCESS
         } else {
-            GasCost::COLD_ACCOUNT_ACCESS.as_u64()
+            GasCost::COLD_ACCOUNT_ACCESS
         } + if has_value {
-            GasCost::CALL_WITH_VALUE.as_u64()
+            GasCost::CALL_WITH_VALUE
                 + if call.kind == CallKind::Call && !callee_exists {
-                    GasCost::NEW_ACCOUNT.as_u64()
+                    GasCost::NEW_ACCOUNT
                 } else {
                     0
                 }
@@ -215,14 +223,13 @@ impl<const N_ARGS: usize> Opcode for CallOpcode<N_ARGS> {
             0
         } + memory_expansion_gas_cost;
         let gas_specified = geth_step.stack.last()?;
-        let callee_gas_left = eip150_gas(geth_step.gas.0 - gas_cost, gas_specified);
+        let callee_gas_left = eip150_gas(geth_step.gas - gas_cost, gas_specified);
 
         // There are 4 branches from here.
         // add failure case for insufficient balance or error depth in the future.
-        match (!is_precheck_ok, is_precompile, is_empty_code_hash) {
+        match (is_precheck_ok, is_precompile, is_empty_code_hash) {
             // 1. Call to precompiled.
-            (false, true, _) => {
-                assert!(call.is_success, "call to precompile should not fail");
+            (true, true, _) => {
                 let caller_ctx = state.caller_ctx_mut()?;
                 let code_address = code_address.unwrap();
                 let (result, contract_gas_cost) = execute_precompiled(
@@ -254,50 +261,47 @@ impl<const N_ARGS: usize> Opcode for CallOpcode<N_ARGS> {
                         result.len().into(),
                     ),
                 ] {
-                    state.call_context_write(&mut exec_step, current_call.call_id, field, value);
+                    state.call_context_write(&mut exec_step, current_call.call_id, field, value)?;
                 }
 
                 log::warn!("missing circuit part of precompile");
                 state.handle_return(&mut exec_step, geth_steps, false)?;
 
-                let real_cost = geth_steps[0].gas.0 - geth_steps[1].gas.0;
-                if real_cost != exec_step.gas_cost.0 {
+                let real_cost = geth_steps[0].gas - geth_steps[1].gas;
+                if real_cost != exec_step.gas_cost {
                     log::warn!(
                         "precompile gas fixed from {} to {}, step {:?}",
-                        exec_step.gas_cost.0,
+                        exec_step.gas_cost,
                         real_cost,
                         geth_steps[0]
                     );
                 }
-                exec_step.gas_cost = GasCost(real_cost);
+                exec_step.gas_cost = real_cost;
                 Ok(vec![exec_step])
             }
             // 2. Call to account with empty code.
-            (false, _, true) => {
+            (true, _, true) => {
                 for (field, value) in [
-                    (CallContextField::LastCalleeId, 0.into()),
+                    (CallContextField::LastCalleeId, call.call_id.into()),
                     (CallContextField::LastCalleeReturnDataOffset, 0.into()),
                     (CallContextField::LastCalleeReturnDataLength, 0.into()),
                 ] {
-                    state.call_context_write(&mut exec_step, current_call.call_id, field, value);
+                    state.call_context_write(&mut exec_step, current_call.call_id, field, value)?;
                 }
                 state.handle_return(&mut exec_step, geth_steps, false)?;
                 Ok(vec![exec_step])
             }
             // 3. Call to account with non-empty code.
-            (false, _, false) => {
+            (true, _, false) => {
                 for (field, value) in [
-                    (
-                        CallContextField::ProgramCounter,
-                        (geth_step.pc.0 + 1).into(),
-                    ),
+                    (CallContextField::ProgramCounter, (geth_step.pc + 1).into()),
                     (
                         CallContextField::StackPointer,
                         (geth_step.stack.stack_pointer().0 + N_ARGS - 1).into(),
                     ),
                     (
                         CallContextField::GasLeft,
-                        (geth_step.gas.0 - gas_cost - callee_gas_left).into(),
+                        (geth_step.gas - gas_cost - callee_gas_left).into(),
                     ),
                     (CallContextField::MemorySize, next_memory_word_size.into()),
                     (
@@ -305,7 +309,7 @@ impl<const N_ARGS: usize> Opcode for CallOpcode<N_ARGS> {
                         (exec_step.reversible_write_counter + 1).into(),
                     ),
                 ] {
-                    state.call_context_write(&mut exec_step, current_call.call_id, field, value);
+                    state.call_context_write(&mut exec_step, current_call.call_id, field, value)?;
                 }
 
                 for (field, value) in [
@@ -343,20 +347,20 @@ impl<const N_ARGS: usize> Opcode for CallOpcode<N_ARGS> {
                     (CallContextField::IsCreate, 0.into()),
                     (CallContextField::CodeHash, call.code_hash.to_word()),
                 ] {
-                    state.call_context_write(&mut exec_step, call.call_id, field, value);
+                    state.call_context_write(&mut exec_step, call.call_id, field, value)?;
                 }
 
                 Ok(vec![exec_step])
             }
 
             // 4. insufficient balance or error depth cases.
-            (true, _, _) => {
+            (false, _, _) => {
                 for (field, value) in [
-                    (CallContextField::LastCalleeId, 0.into()),
+                    (CallContextField::LastCalleeId, call.call_id.into()),
                     (CallContextField::LastCalleeReturnDataOffset, 0.into()),
                     (CallContextField::LastCalleeReturnDataLength, 0.into()),
                 ] {
-                    state.call_context_write(&mut exec_step, current_call.call_id, field, value);
+                    state.call_context_write(&mut exec_step, current_call.call_id, field, value)?;
                 }
                 state.handle_return(&mut exec_step, geth_steps, false)?;
                 Ok(vec![exec_step])
@@ -367,7 +371,7 @@ impl<const N_ARGS: usize> Opcode for CallOpcode<N_ARGS> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{circuit_input_builder::CircuitsParams, mock::BlockData};
+    use crate::mock::BlockData;
     use eth_types::{bytecode, evm_types::OpcodeId, geth_types::GethData, word, Bytecode, Word};
     use mock::{
         test_ctx::{
@@ -391,7 +395,6 @@ mod tests {
             value: Word,
             gas: Word,
             stack_value: Vec<(Word, Word)>,
-            max_rws: usize,
         }
 
         impl Default for PrecompileCall {
@@ -407,7 +410,6 @@ mod tests {
                     value: Word::from(0),
                     gas: Word::from(0xFFFFFFF),
                     stack_value: vec![],
-                    max_rws: 500,
                 }
             }
         }
@@ -643,7 +645,6 @@ mod tests {
                 call_data_length: Word::from(0x180),
                 address: Word::from(0x8),
                 stack_value: vec![(Word::from(0x0), Word::from(1))],
-                max_rws: 3000,
                 ..Default::default()
             },
             PrecompileCall {
@@ -694,7 +695,6 @@ mod tests {
                         word!("8c9bcf367e6096a3ba7ca8485ae67bb2bf894fe72f36e3cf1361d5f3af54fa5"),
                     ),
                 ],
-                max_rws: 1500,
                 ..Default::default()
             },
         ];
@@ -721,14 +721,7 @@ mod tests {
             .unwrap()
             .into();
 
-            let mut builder = BlockData::new_from_geth_data_with_params(
-                block.clone(),
-                CircuitsParams {
-                    max_rws: test_call.max_rws,
-                    ..Default::default()
-                },
-            )
-            .new_circuit_input_builder();
+            let builder = BlockData::new_from_geth_data(block.clone()).new_circuit_input_builder();
             builder
                 .handle_block(&block.eth_block, &block.geth_traces)
                 .unwrap();
@@ -742,7 +735,8 @@ mod tests {
                 assert_eq!(
                     *stack_value,
                     step.stack.nth_last(offset).expect("stack value not found"),
-                    "stack output mismatch"
+                    "stack output mismatch {}",
+                    test_call.name
                 );
             }
         }
