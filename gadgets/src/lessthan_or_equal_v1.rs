@@ -142,7 +142,7 @@ impl<F: Field, const N_BYTES: usize> LtEqV1Instruction<F> for LtEqV1Chip<F, N_BY
         let con1 = lhs + rhs;
         let con2 = lhs1 + rhs1;
 
-        let lt = con1 < (con2 + F::one());
+        let lt = con1 < (con2 + F::ONE);
 
         // println!("Anything wrong here? {:?} {:?}", con1, con2);
 
@@ -153,7 +153,7 @@ impl<F: Field, const N_BYTES: usize> LtEqV1Instruction<F> for LtEqV1Chip<F, N_BY
             || Value::known(F::from(lt as u64)),
         )?;
 
-        let diff = (con1 - (con2 + F::one())) + (if lt { config.range } else { F::zero() });
+        let diff = (con1 - (con2 + F::ONE)) + (if lt { config.range } else { F::ZERO });
         let diff_bytes = diff.to_repr();
         let diff_bytes = diff_bytes.as_ref();
         for (idx, diff_column) in config.diff.iter().enumerate() {

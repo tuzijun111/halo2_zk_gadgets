@@ -119,7 +119,7 @@ impl<F: Field, const N_BYTES: usize> LtEqInstruction<F> for LtEqChip<F, N_BYTES>
     ) -> Result<(), Error> {
         let config = self.config();
 
-        let lt = lhs < (rhs + F::one());
+        let lt = lhs < (rhs + F::ONE);
         region.assign_advice(
             || "lt chip: lt",
             config.lt,
@@ -127,7 +127,7 @@ impl<F: Field, const N_BYTES: usize> LtEqInstruction<F> for LtEqChip<F, N_BYTES>
             || Value::known(F::from(lt as u64)),
         )?;
 
-        let diff = (lhs - (rhs + F::one())) + (if lt { config.range } else { F::zero() });
+        let diff = (lhs - (rhs + F::ONE)) + (if lt { config.range } else { F::ZERO });
         let diff_bytes = diff.to_repr();
         let diff_bytes = diff_bytes.as_ref();
         for (idx, diff_column) in config.diff.iter().enumerate() {
