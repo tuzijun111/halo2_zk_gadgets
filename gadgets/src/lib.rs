@@ -15,8 +15,8 @@ pub mod batched_is_zero;
 pub mod binary_number;
 pub mod is_zero;
 pub mod less_than;
-pub mod less_than_or_equal;
-pub mod less_than_or_equal_v1;
+pub mod lessthan_or_equal;
+pub mod lessthan_or_equal_v1;
 pub mod mul_add;
 pub mod util;
 
