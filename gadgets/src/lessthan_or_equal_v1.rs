@@ -206,7 +206,7 @@ mod test {
     use super::{LtEqV1Chip, LtEqV1Config, LtEqV1Instruction};
     use eth_types::Field;
     use halo2_proofs::{
-        arithmetic::Field,
+        // arithmetic::Field,
         circuit::{Layouter, SimpleFloorPlanner, Value},
         dev::MockProver,
         halo2curves::bn256::Fr as Fp,
@@ -397,7 +397,7 @@ mod test {
         }
 
         // ok
-        try_test_circuit!(vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![true, true, true, true], Ok(()));
+        try_test_circuit!(vec![1, 2, 3, 4], vec![2, 2, 7, 8], vec![true, true, true, true], Ok(()));
         // try_test_circuit!(vec![1, 2, 1, 3, 2], vec![true, false, true, false], Ok(()));
         // // error
         // try_test_circuit_error!(vec![5, 4, 3, 2, 1], vec![true, true, true, true]);

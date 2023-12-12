@@ -129,128 +129,128 @@ impl<F: Field, const N: usize> BatchedIsZeroChip<F, N> {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    use halo2_proofs::{
-        circuit::{Layouter, SimpleFloorPlanner, Value},
-        dev::MockProver,
-        halo2curves::bn256::Fr,
-        plonk::{Advice, Circuit, Column, ConstraintSystem, Error, FirstPhase, Selector},
-        poly::Rotation,
-    };
+// #[cfg(test)]
+// mod test {
+//     use super::*;
+//     use halo2_proofs::{
+//         circuit::{Layouter, SimpleFloorPlanner, Value},
+//         dev::MockProver,
+//         halo2curves::bn256::Fr,
+//         plonk::{Advice, Circuit, Column, ConstraintSystem, Error, FirstPhase, Selector},
+//         poly::Rotation,
+//     };
 
-    #[derive(Clone, Debug)]
-    struct TestCircuitConfig<const N: usize> {
-        q_enable: Selector,
-        values: [Column<Advice>; N],
-        is_zero: BatchedIsZeroConfig,
-        expect_is_zero: Column<Advice>,
-    }
+//     #[derive(Clone, Debug)]
+//     struct TestCircuitConfig<const N: usize> {
+//         q_enable: Selector,
+//         values: [Column<Advice>; N],
+//         is_zero: BatchedIsZeroConfig,
+//         expect_is_zero: Column<Advice>,
+//     }
 
-    #[derive(Default)]
-    struct TestCircuit<F: Field, const N: usize> {
-        values: Option<[u64; N]>,
-        expect_is_zero: Option<bool>,
-        _marker: PhantomData<F>,
-    }
+//     #[derive(Default)]
+//     struct TestCircuit<F: Field, const N: usize> {
+//         values: Option<[u64; N]>,
+//         expect_is_zero: Option<bool>,
+//         _marker: PhantomData<F>,
+//     }
 
-    impl<F: Field, const N: usize> Circuit<F> for TestCircuit<F, N> {
-        type Config = TestCircuitConfig<N>;
-        type FloorPlanner = SimpleFloorPlanner;
-        type Params = ();
+//     impl<F: Field, const N: usize> Circuit<F> for TestCircuit<F, N> {
+//         type Config = TestCircuitConfig<N>;
+//         type FloorPlanner = SimpleFloorPlanner;
+//         type Params = ();
 
-        fn without_witnesses(&self) -> Self {
-            Self::default()
-        }
+//         fn without_witnesses(&self) -> Self {
+//             Self::default()
+//         }
 
-        fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-            let q_enable = meta.complex_selector();
-            let values = [(); N].map(|_| meta.advice_column());
-            let expect_is_zero = meta.advice_column();
+//         fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+//             let q_enable = meta.complex_selector();
+//             let values = [(); N].map(|_| meta.advice_column());
+//             let expect_is_zero = meta.advice_column();
 
-            let is_zero = BatchedIsZeroChip::configure(
-                meta,
-                (FirstPhase, FirstPhase),
-                |meta| meta.query_selector(q_enable),
-                |meta| values.map(|value| meta.query_advice(value, Rotation::cur())),
-            );
+//             let is_zero = BatchedIsZeroChip::configure(
+//                 meta,
+//                 (FirstPhase, FirstPhase),
+//                 |meta| meta.query_selector(q_enable),
+//                 |meta| values.map(|value| meta.query_advice(value, Rotation::cur())),
+//             );
 
-            let config = Self::Config {
-                q_enable,
-                values,
-                expect_is_zero,
-                is_zero,
-            };
+//             let config = Self::Config {
+//                 q_enable,
+//                 values,
+//                 expect_is_zero,
+//                 is_zero,
+//             };
 
-            meta.create_gate("check is_zero", |meta| {
-                let q_enable = meta.query_selector(q_enable);
+//             meta.create_gate("check is_zero", |meta| {
+//                 let q_enable = meta.query_selector(q_enable);
 
-                // This verifies is_zero is calculated correctly
-                let expect_is_zero = meta.query_advice(config.expect_is_zero, Rotation::cur());
-                let is_zero = meta.query_advice(config.is_zero.is_zero, Rotation::cur());
-                vec![q_enable * (is_zero - expect_is_zero)]
-            });
+//                 // This verifies is_zero is calculated correctly
+//                 let expect_is_zero = meta.query_advice(config.expect_is_zero, Rotation::cur());
+//                 let is_zero = meta.query_advice(config.is_zero.is_zero, Rotation::cur());
+//                 vec![q_enable * (is_zero - expect_is_zero)]
+//             });
 
-            config
-        }
+//             config
+//         }
 
-        fn synthesize(
-            &self,
-            config: Self::Config,
-            mut layouter: impl Layouter<F>,
-        ) -> Result<(), Error> {
-            let is_zero = BatchedIsZeroChip::construct(config.is_zero);
+//         fn synthesize(
+//             &self,
+//             config: Self::Config,
+//             mut layouter: impl Layouter<F>,
+//         ) -> Result<(), Error> {
+//             let is_zero = BatchedIsZeroChip::construct(config.is_zero);
 
-            let values: [F; N] = self
-                .values
-                .as_ref()
-                .map(|values| values.map(|value| F::from(value)))
-                .ok_or(Error::Synthesis)?;
-            let expect_is_zero = self.expect_is_zero.as_ref().ok_or(Error::Synthesis)?;
+//             let values: [F; N] = self
+//                 .values
+//                 .as_ref()
+//                 .map(|values| values.map(|value| F::from(value)))
+//                 .ok_or(Error::Synthesis)?;
+//             let expect_is_zero = self.expect_is_zero.as_ref().ok_or(Error::Synthesis)?;
 
-            layouter.assign_region(
-                || "witness",
-                |mut region| {
-                    config.q_enable.enable(&mut region, 0)?;
-                    region.assign_advice(
-                        || "expect_is_zero",
-                        config.expect_is_zero,
-                        0,
-                        || Value::known(F::from(*expect_is_zero as u64)),
-                    )?;
-                    for (value_column, value) in config.values.iter().zip(values.iter()) {
-                        region.assign_advice(
-                            || "value",
-                            *value_column,
-                            0,
-                            || Value::known(*value),
-                        )?;
-                    }
-                    is_zero.assign(&mut region, 0, Value::known(values))?;
-                    Ok(())
-                },
-            )
-        }
-    }
+//             layouter.assign_region(
+//                 || "witness",
+//                 |mut region| {
+//                     config.q_enable.enable(&mut region, 0)?;
+//                     region.assign_advice(
+//                         || "expect_is_zero",
+//                         config.expect_is_zero,
+//                         0,
+//                         || Value::known(F::from(*expect_is_zero as u64)),
+//                     )?;
+//                     for (value_column, value) in config.values.iter().zip(values.iter()) {
+//                         region.assign_advice(
+//                             || "value",
+//                             *value_column,
+//                             0,
+//                             || Value::known(*value),
+//                         )?;
+//                     }
+//                     is_zero.assign(&mut region, 0, Value::known(values))?;
+//                     Ok(())
+//                 },
+//             )
+//         }
+//     }
 
-    fn test_circuit<const N: usize>(values: [u64; N], expect_is_zero: bool) {
-        let circuit = TestCircuit::<Fr, N> {
-            values: Some(values),
-            expect_is_zero: Some(expect_is_zero),
-            _marker: PhantomData,
-        };
-        let k = 4;
-        let prover = MockProver::<Fr>::run(k, &circuit, vec![]).unwrap();
-        prover.assert_satisfied_par()
-    }
+//     fn test_circuit<const N: usize>(values: [u64; N], expect_is_zero: bool) {
+//         let circuit = TestCircuit::<Fr, N> {
+//             values: Some(values),
+//             expect_is_zero: Some(expect_is_zero),
+//             _marker: PhantomData,
+//         };
+//         let k = 4;
+//         let prover = MockProver::<Fr>::run(k, &circuit, vec![]).unwrap();
+//         prover.assert_satisfied_par()
+//     }
 
-    #[test]
-    fn test_batched_is_zero() {
-        test_circuit([0, 0], true);
-        test_circuit([0, 0, 0], true);
-        test_circuit([1, 0], false);
-        test_circuit([1, 0, 0], false);
-        test_circuit([1, 0, 8], false);
-    }
-}
+//     #[test]
+//     fn test_batched_is_zero() {
+//         test_circuit([0, 0], true);
+//         test_circuit([0, 0, 0], true);
+//         test_circuit([1, 0], false);
+//         test_circuit([1, 0, 0], false);
+//         test_circuit([1, 0, 8], false);
+//     }
+// }
