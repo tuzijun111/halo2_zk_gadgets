@@ -18,7 +18,6 @@ pub mod less_than;
 pub mod lessthan_or_equal;
 pub mod lessthan_or_equal_v1;
 pub mod lessthan_or_equal_3T;
-pub mod disjoint;
 pub mod mul_add;
 pub mod util;
 
