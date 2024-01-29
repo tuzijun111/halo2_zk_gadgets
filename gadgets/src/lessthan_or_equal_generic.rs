@@ -69,7 +69,7 @@ impl<F: Field, const N_BYTES: usize> LtEqGenericChip<F, N_BYTES> {
         let u8 = meta.fixed_column();
 
 
-        meta.create_gate("lt gate", |meta| {
+        meta.create_gate("lt generic gate", |meta| {
             let q_enable = q_enable(meta);
             let lt = meta.query_advice(lt, Rotation::cur());
 
